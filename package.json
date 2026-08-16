@@ -28,5 +28,9 @@
   },
   "peerDependencies": {
     "@opencode-ai/plugin": ">=1.4.0"
+  },
+  "optionalDependencies": {
+    "@huggingface/transformers": "^4.2.0",
+    "onnxruntime-node": "^1.20.1"
   }
 }

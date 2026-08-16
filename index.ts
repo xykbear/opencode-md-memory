@@ -27,6 +27,12 @@ interface MdMemoryOptions {
   idPrefix?: string
   /** Max entries in the read-set (default 200) */
   maxReadSet?: number
+  /** Enable semantic search via md_search_similar (requires optional deps). Default false */
+  semanticSearch?: boolean
+  /** Embedding model id for semantic search. Default cached all-MiniLM-L6-v2 */
+  semanticModel?: string
+  /** Top-k results for semantic search (default 5) */
+  semanticTopK?: number
 }
 
 interface ResolvedConfig {
@@ -34,6 +40,9 @@ interface ResolvedConfig {
   storageRoot?: string
   idPrefix: string
   maxReadSet: number
+  semanticSearch: boolean
+  semanticModel: string
+  semanticTopK: number
 }
 
 const readSet = new Set<string>()
@@ -71,6 +80,9 @@ function resolveConfig(options: MdMemoryOptions): ResolvedConfig {
     storageRoot,
     idPrefix: options.idPrefix ?? "mdm_",
     maxReadSet: options.maxReadSet ?? 200,
+    semanticSearch: options.semanticSearch ?? false,
+    semanticModel: options.semanticModel ?? "Xenova/all-MiniLM-L6-v2",
+    semanticTopK: options.semanticTopK ?? 5,
   }
 }
 
@@ -269,9 +281,175 @@ async function runSearch(root: string, config: ResolvedConfig, scope: string | u
   return out
 }
 
-export const server: Plugin = async (_input, options: MdMemoryOptions = {}) => {
+// --- Semantic search (optional, requires @huggingface/transformers + onnxruntime-node) ---
+
+interface Embedder {
+  embed(text: string): Promise<number[]>
+  embedMany(texts: string[]): Promise<number[][]>
+}
+
+interface LoadResult {
+  ok: true
+  embedder: Embedder
+  reason?: never
+}
+interface LoadFailure {
+  ok: false
+  reason: "deps" | "model"
+}
+
+let embedderState: { modelId: string; promise: Promise<LoadResult | LoadFailure> } | null = null
+
+/** Lazily load the embedding pipeline. Distinguishes missing deps from model-load failures; failures are not cached so later calls retry. */
+function getEmbedder(modelId: string): Promise<LoadResult | LoadFailure> {
+  if (embedderState && embedderState.modelId === modelId) return embedderState.promise
+  const promise = (async (): Promise<LoadResult | LoadFailure> => {
+    try {
+      const { pipeline, env } = await import("@huggingface/transformers")
+      env.allowRemoteModels = true
+      const pipe = await pipeline("feature-extraction", modelId)
+      return {
+        ok: true,
+        embedder: {
+          async embed(text: string): Promise<number[]> {
+            const out = await pipe(text, { pooling: "mean", normalize: true })
+            return Array.from(out.data as Float32Array)
+          },
+          async embedMany(texts: string[]): Promise<number[][]> {
+            const out = await pipe(texts, { pooling: "mean", normalize: true })
+            const data = out.data as Float32Array
+            const dims = (out.dims as number[])[out.dims.length - 1]
+            const result: number[][] = []
+            for (let i = 0; i < texts.length; i++) {
+              result.push(Array.from(data.subarray(i * dims, (i + 1) * dims)))
+            }
+            return result
+          },
+        },
+      }
+    } catch (e) {
+      // Missing import => deps not installed; any other throw (fetch, model parse) => model unavailable.
+      const code = (e as { code?: string })?.code
+      return { ok: false, reason: code === "ERR_MODULE_NOT_FOUND" ? "deps" : "model" }
+    }
+  })()
+  embedderState = { modelId, promise }
+  return promise
+}
+
+/** Cosine similarity between two vectors (both assumed normalized or not; we normalize inline) */
+function cosine(a: number[], b: number[]): number {
+  let dot = 0
+  let na = 0
+  let nb = 0
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i]
+    na += a[i] * a[i]
+    nb += b[i] * b[i]
+  }
+  const denom = Math.sqrt(na) * Math.sqrt(nb)
+  return denom === 0 ? 0 : dot / denom
+}
+
+/** In-memory doc-vector cache keyed by file path + mtime, avoiding re-embedding unchanged files. */
+const semanticCache = new Map<string, number[]>()
+
+/** Embed all docs (batched), caching by path+mtime. Content beyond the model's token window (MiniLM: 512 tokens) is not represented. */
+async function embedDocs(
+  embedder: Embedder,
+  files: { path: string; mtimeMs: number; content: string }[]
+): Promise<Map<string, number[]>> {
+  const out = new Map<string, number[]>()
+  const byKey = new Map<string, { path: string; content: string }>()
+  const todoKeys: string[] = []
+  for (const f of files) {
+    const key = `${f.path}:${f.mtimeMs}`
+    const cached = semanticCache.get(key)
+    if (cached) {
+      out.set(f.path, cached)
+    } else {
+      byKey.set(key, { path: f.path, content: f.content })
+      todoKeys.push(key)
+    }
+  }
+  if (todoKeys.length) {
+    const todo = todoKeys.map((k) => byKey.get(k)!.content)
+    const vecs = await embedder.embedMany(todo)
+    for (let i = 0; i < vecs.length; i++) {
+      const key = todoKeys[i]
+      const entry = byKey.get(key)!
+      semanticCache.set(key, vecs[i])
+      out.set(entry.path, vecs[i])
+    }
+    if (semanticCache.size > 5000) semanticCache.clear()
+  }
+  return out
+}
+
+/** Semantic search across memories; returns top-k scored entries. Returns a hint string when embedding deps are unavailable. */
+async function runSemanticSearch(
+  root: string,
+  config: ResolvedConfig,
+  scope: string | undefined,
+  query: string,
+  topK: number,
+  log: (level: "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) => void
+): Promise<string[] | string> {
+  const files = await collectMd(root, config, scope)
+  if (!files.length) return []
+  const loaded = await getEmbedder(config.semanticModel)
+  if (!loaded.ok) {
+    const message =
+      loaded.reason === "deps"
+        ? "[warning] semantic search unavailable: @huggingface/transformers not installed. Run: npm i @huggingface/transformers onnxruntime-node"
+        : `[warning] semantic search unavailable: embedding model "${config.semanticModel}" could not be loaded. Check network or configure semanticModel.`
+    log("warn", message.replace(/^\[warning\] /, ""), { reason: loaded.reason })
+    return message
+  }
+  const embedder = loaded.embedder
+
+  const docs: { path: string; mtimeMs: number; content: string }[] = []
+  for (const f of files) {
+    try {
+      const st = await fs.stat(f)
+      const content = await fs.readFile(f, "utf-8")
+      docs.push({ path: f, mtimeMs: st.mtimeMs, content: content.slice(0, 8000) })
+    } catch {
+      /* skip unreadable */
+    }
+  }
+  if (!docs.length) return []
+
+  const k = Math.max(1, Math.floor(topK))
+  const qVec = await embedder.embed(query)
+  const docVecs = await embedDocs(embedder, docs)
+  const scored: { id: string; rel: string; score: number }[] = []
+  for (const d of docs) {
+    const vec = docVecs.get(d.path)
+    if (!vec) continue
+    const score = cosine(qVec, vec)
+    const id = idFromFile(path.basename(d.path), config.idPrefix) ?? ""
+    const rel = path.relative(memoryRoot(root, config), d.path).replace(/\\/g, "/")
+    scored.push({ id, rel, score })
+  }
+  scored.sort((a, b) => b.score - a.score)
+  return scored.slice(0, k).map((s) => `${s.id}  ${s.rel}  (${s.score.toFixed(3)})`)
+}
+
+export const server: Plugin = async (input, options: MdMemoryOptions = {}) => {
   const config = resolveConfig(options)
   const { idPrefix } = config
+
+  /** Log an event to the opencode log (debug level so routine operations stay quiet), swallowing failures. */
+  const log = (level: "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) => {
+    try {
+      void input.client.app.log({
+        body: { service: "opencode-md-memory", level, message, extra },
+      })
+    } catch {
+      /* logging is best-effort */
+    }
+  }
 
   return {
     tool: {
@@ -334,6 +512,7 @@ export const server: Plugin = async (_input, options: MdMemoryOptions = {}) => {
         async execute(args, context) {
           try {
             if (!readSet.has(args.id)) {
+              log("warn", `md_update gate denied for ${args.id} (not in read set)`)
               return `[gate] id=${args.id} is not in the read set. Use md_read first to load it, then update.`
             }
             const abs = await locateById(context.directory, config, args.id)
@@ -341,6 +520,7 @@ export const server: Plugin = async (_input, options: MdMemoryOptions = {}) => {
             await fs.writeFile(abs, args.content, "utf-8")
             return `updated ${args.id}`
           } catch (e) {
+            log("error", `md_update failed: ${(e as Error).message}`)
             return `[error] ${(e as Error).message}`
           }
         },
@@ -354,6 +534,7 @@ export const server: Plugin = async (_input, options: MdMemoryOptions = {}) => {
         async execute(args, context) {
           try {
             if (!readSet.has(args.id)) {
+              log("warn", `md_delete gate denied for ${args.id} (not in read set)`)
               return `[gate] id=${args.id} is not in the read set. Use md_read first to load it, then delete.`
             }
             const abs = await locateById(context.directory, config, args.id)
@@ -362,6 +543,7 @@ export const server: Plugin = async (_input, options: MdMemoryOptions = {}) => {
             readSet.delete(args.id)
             return `deleted ${args.id}`
           } catch (e) {
+            log("error", `md_delete failed: ${(e as Error).message}`)
             return `[error] ${(e as Error).message}`
           }
         },
@@ -404,6 +586,32 @@ export const server: Plugin = async (_input, options: MdMemoryOptions = {}) => {
           }
         },
       }),
+
+      ...(config.semanticSearch
+        ? {
+            md_search_similar: tool({
+              description:
+                "Semantic search across memory content. Finds memories related in meaning to the query. Requires optional embedding deps; returns a message if unavailable.",
+              args: {
+                query: tool.schema.string().describe("Semantic query"),
+                scope: tool.schema.string().optional().describe("all-modules or a module name (omit for root)"),
+                topK: tool.schema.number().optional().describe("Results count (default from config)"),
+              },
+              async execute(args, context) {
+                try {
+                  const topK = args.topK ?? config.semanticTopK
+                  const results = await runSemanticSearch(context.directory, config, args.scope, args.query, topK, log)
+                  if (typeof results === "string") return results
+                  if (!results.length) return "(no match)"
+                  return results.join("\n")
+                } catch (e) {
+                  log("error", `md_search_similar failed: ${(e as Error).message}`)
+                  return `[error] ${(e as Error).message}`
+                }
+              },
+            }),
+          }
+        : {}),
     },
   }
 }
