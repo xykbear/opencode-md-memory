@@ -1,12 +1,13 @@
 {
   "name": "opencode-md-memory",
   "version": "1.0.0",
-  "description": "基于本地 Markdown 文件的轻量记忆系统 — opencode 插件。简短 id、scope 模块隔离、rg 全文搜索、门禁机制。",
+  "description": "A lightweight, local-first memory system for opencode backed by plain Markdown files. Short ids, module scoping, rg full-text search, write gate.",
   "type": "module",
   "main": "index.ts",
   "files": [
     "index.ts",
-    "README.md"
+    "README.md",
+    "README.zh-CN.md"
   ],
   "keywords": [
     "opencode",
@@ -18,12 +19,12 @@
   "license": "MIT",
   "author": "Aoi Xiong <xykbear@hotmail.com>",
   "bugs": {
-    "url": "https://github.com/xykbear/md-memory-plugin/issues"
+    "url": "https://github.com/xykbear/opencode-md-memory/issues"
   },
-  "homepage": "https://github.com/xykbear/md-memory-plugin",
+  "homepage": "https://github.com/xykbear/opencode-md-memory",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/xykbear/md-memory-plugin.git"
+    "url": "git+https://github.com/xykbear/opencode-md-memory.git"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": ">=1.4.0"

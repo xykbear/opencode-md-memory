@@ -1,100 +1,97 @@
 # opencode-md-memory
 
-基于本地 Markdown 文件的轻量记忆系统 — opencode 插件。
+A lightweight, local-first memory system for opencode, backed by plain Markdown files.
 
-比 opencode-mem 更适合**长期记忆索引**：无 30 天自动清理、grep 全文可搜、按 id 精确读取、scope 模块隔离。
+No vector database, no embeddings, no auto-cleanup — memories are just `.md` files you can read, edit, grep, and version with git.
 
-## 安装
+## Features
 
-### 方式一：npm 安装
+- **Plain Markdown storage** — each memory is a file under `<project>/.memory/`
+- **Stable ids** — short ids (`mdm_<n>`) embedded in filenames, no index to maintain
+- **Exact read by id** — read a memory directly by its id, no fuzzy matching
+- **Full-text search** — `rg`-powered (falls back to JS matching), across scopes
+- **Module scoping** — organize memories into per-module subdirectories
+- **Write gate** — update/delete require a prior read of the file, preventing blind mutations
+- **Permanent by design** — nothing is auto-deleted; version your `.memory/` with git
+- **Zero dependencies** — no embedding model, no network, no background service
 
-```bash
-npm install opencode-md-memory
-```
+## Installation
 
-`~/.config/opencode/opencode.json` 注册：
+### Local file
+
+Copy `index.ts` into `~/.config/opencode/plugins/` (global) or `.opencode/plugins/` (project) and restart opencode. The plugin is auto-loaded.
+
+### From GitHub
+
+Add to `~/.config/opencode/opencode.json`:
 
 ```json
 {
-  "plugin": ["opencode-md-memory"]
+  "plugin": ["opencode-md-memory@git+https://github.com/xykbear/opencode-md-memory.git"]
 }
 ```
 
-### 方式二：本地文件
+Then restart opencode.
 
-复制 `index.ts` 到 `~/.config/opencode/plugins/`，重启 opencode 自动加载。
+## Tools
 
-### 方式三：GitHub
+| Tool       | Description                                                                 |
+|------------|-----------------------------------------------------------------------------|
+| `md_create` | Create a new Markdown memory; returns its id.                              |
+| `md_read`   | Read a memory by id; marks it as read (required before update/delete).     |
+| `md_update` | Update a memory by id. Requires a prior `md_read` of that id.              |
+| `md_delete` | Delete a memory by id. Requires a prior `md_read` of that id.              |
+| `md_list`   | List memory files.                                                          |
+| `md_search` | Full-text search across memory content.                                     |
 
-```json
-{
-  "plugin": ["md-memory-plugin@git+https://github.com/xykbear/md-memory-plugin.git"]
-}
-```
+## Core design
 
-## 工具
+- **Id-based**: short id (`mdm_<n>`) embedded at the start of the filename, parsed from the filename — no index mapping needed.
+- **Scope**: omitted → root; `all-modules` → root + all modules; `<module>` → that module's first-level directory.
+- **Gate**: `md_update` / `md_delete` refuse to run unless the id was read first via `md_read`.
+- **Search**: `rg` first, falls back to JS string matching.
+- **Storage**: `<project>/.memory/` with an atomic counter.
 
-| 工具 | 描述 |
-|------|------|
-| md_create | 新建一条 Markdown 记忆，返回 id。 |
-| md_read | 按 id 读取记忆，并记录为已读。 |
-| md_update | 按 id 更新已有记忆。需先 md_read 该 id。 |
-| md_delete | 按 id 删除记忆。需先 md_read 该 id。 |
-| md_list | 列出记忆文件。 |
-| md_search | 全文搜索记忆内容。 |
-
-## 核心设计
-
-- **id 化**：简短 id（`mdm_<n>`）内嵌文件名开头，从文件名解析，无需索引映射
-- **scope**：省略→根目录；`all-modules`→根+所有模块；`<module>`→该模块一级目录
-- **门禁**：`md_update` / `md_delete` 必须先 `md_read`，否则拒绝
-- **搜索**：rg 优先，失败回退 JS 字符串匹配
-- **存储**：`<项目>/.memory/`，atomic 计数器
-
-## 存储结构
+## Storage layout
 
 ```
 .memory/
-├── meta.json              # 计数器 { "next_id": N }
-├── mdm_1-<slug>.md        # 根目录（省略 scope）
+├── meta.json              # counter { "next_id": N }
+├── mdm_1-<slug>.md        # root scope (scope omitted)
 └── cell-trace/
-    └── mdm_2-<slug>.md    # 模块 scope
+    └── mdm_2-<slug>.md    # module scope
 ```
 
-## 使用示例
+## Usage
 
 ```
-# 创建记忆（省略 scope → 根目录）
-md_create({ name: "能量密度", content: "# 能量密度\n..." })
-→ 已创建 mdm_1
+# Create a memory (scope omitted → root)
+md_create({ name: "energy-density", content: "# Energy density\n..." })
+→ created mdm_1
 
-# 指定模块
-md_create({ name: "低温性能", content: "...", scope: "cell-trace" })
-→ 已创建 mdm_2
+# Create within a module
+md_create({ name: "low-temp", content: "...", scope: "cell-trace" })
+→ created mdm_2
 
-# 读取（门禁前提）
+# Read (gate precondition)
 md_read({ id: "mdm_1" })
 
-# 更新（需先 read）
-md_update({ id: "mdm_1", content: "新内容" })
+# Update (requires prior read)
+md_update({ id: "mdm_1", content: "new content" })
 
-# 搜索（跨模块）
-md_search({ query: "能量", scope: "all-modules" })
+# Search across modules
+md_search({ query: "energy", scope: "all-modules" })
 
-# 列出
+# List
 md_list({ scope: "cell-trace" })
 ```
 
-## 对比 opencode-mem
+## Why Markdown files?
 
-| | opencode-mem | md-memory |
-|---|-------------|-----------|
-| 存储 | 向量库（SQLite 分片） | Markdown 文件 |
-| 持久性 | 30 天自动清理 | 永久（git 管理） |
-| 检索 | 纯向量语义搜索 | grep 全文搜索 |
-| 按 ID 精确读 | ❌ 无 | ✅ `md_read` |
-| 跨模块 | 无 | scope 模块隔离 |
-| 依赖 | 向量库 + embedding 服务 | 零外部依赖 |
+- Human-readable and editable outside of opencode.
+- `git`-friendly: diffs, history, and collaboration work out of the box.
+- Fully searchable with standard tools (`rg`, `grep`, your editor).
+- No background service, no embedding model, no network round-trips.
 
 ## License
 
