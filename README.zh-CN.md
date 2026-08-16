@@ -60,7 +60,7 @@
 | `idPrefix`    | string | `mdm_`      | 记忆文件 id 前缀，例如 `"mem_"` → `mem_1`。                                              |
 | `maxReadSet`  | number | `200`       | 跟踪为「已读」的最大 id 数；写入门禁（update/delete 需先 read）只记住这么多条。          |
 
-> `storageRoot` 支持 `~`（展开为家目录）。设置后记忆直接存储在指定位置，而非 `<项目>/.memory/`。
+> `storageRoot` 支持 `~`（展开为用户主目录）。设置后记忆直接存储在指定位置，而非 `<项目>/.memory/`。
 
 ## 工具
 
