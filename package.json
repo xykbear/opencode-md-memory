@@ -7,7 +7,8 @@
   "files": [
     "index.ts",
     "README.md",
-    "README.zh-CN.md"
+    "README.zh-CN.md",
+    "python/embed_server.py"
   ],
   "keywords": [
     "opencode",
@@ -28,9 +29,5 @@
   },
   "peerDependencies": {
     "@opencode-ai/plugin": ">=1.4.0"
-  },
-  "optionalDependencies": {
-    "@huggingface/transformers": "^4.2.0",
-    "onnxruntime-node": "^1.20.1"
   }
 }

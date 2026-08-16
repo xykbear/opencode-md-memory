@@ -2,8 +2,9 @@ import { type Plugin, tool } from "@opencode-ai/plugin"
 import { promises as fs } from "fs"
 import * as path from "path"
 import * as os from "os"
-import { execFile } from "child_process"
+import { execFile, spawn } from "child_process"
 import { promisify } from "util"
+import { fileURLToPath } from "url"
 
 const execFileAsync = promisify(execFile)
 
@@ -31,9 +32,9 @@ interface MdMemoryOptions {
   maxReadSet?: number
   /** Inject matching memory references into chat via the chat.message hook (requires optional deps). Default false */
   injectorEnabled?: boolean
-  /** Embedding backend: "local" (transformers.js, default) or "remote" (OpenAI-compatible API) */
-  embeddingBackend?: "local" | "remote"
-  /** Embedding model id for local backend. Default cached all-MiniLM-L6-v2 */
+  /** Embedding backend: "remote" (OpenAI-compatible API) or "python" (local Python embed server). Default "remote" */
+  embeddingBackend?: "remote" | "python"
+  /** Embedding model id for remote backend, e.g. text-embedding-3-small */
   semanticModel?: string
   /** Base URL for remote embeddings API, e.g. https://api.openai.com/v1 */
   remoteApiUrl?: string
@@ -55,7 +56,7 @@ interface ResolvedConfig {
   idPrefix: string
   maxReadSet: number
   injectorEnabled: boolean
-  embeddingBackend: "local" | "remote"
+  embeddingBackend: "remote" | "python"
   semanticModel: string
   remoteApiUrl?: string
   remoteApiKey?: string
@@ -104,8 +105,8 @@ function resolveConfig(options: MdMemoryOptions): ResolvedConfig {
     idPrefix: options.idPrefix ?? "mdm_",
     maxReadSet: options.maxReadSet ?? 200,
     injectorEnabled: options.injectorEnabled ?? false,
-    embeddingBackend: options.embeddingBackend ?? "local",
-    semanticModel: options.semanticModel ?? "Xenova/all-MiniLM-L6-v2",
+    embeddingBackend: options.embeddingBackend ?? "remote",
+    semanticModel: options.semanticModel ?? "text-embedding-3-small",
     remoteApiUrl: options.remoteApiUrl?.replace(/\/+$/, ""),
     remoteApiKey: options.remoteApiKey,
     remoteModel: options.remoteModel,
@@ -350,25 +351,61 @@ function resolveSecret(value: string | undefined): string | undefined {
   return value
 }
 
-/** Build the local transformers.js embedder. */
-async function buildLocalEmbedder(modelId: string): Promise<Embedder> {
-  const { pipeline, env } = await import("@huggingface/transformers")
-  env.allowRemoteModels = true
-  const pipe = await pipeline("feature-extraction", modelId)
+// --- Python embed server (local backend: spawn python/embed_server.py, call over HTTP) ---
+
+const PYTHON = process.env.PYTHON || "python3"
+const EMBED_SERVER_PORT = 48611
+const PYTHON_SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), "python", "embed_server.py")
+let pythonServer: ReturnType<typeof spawn> | null = null
+
+/** Ensure the Python embed server is running; returns its base URL or null. */
+async function ensurePythonServer(): Promise<string | null> {
+  const url = `http://127.0.0.1:${EMBED_SERVER_PORT}`
+  try {
+    const res = await fetch(`${url}/health`)
+    if (res.ok) return url
+  } catch {
+    /* not running */
+  }
+  pythonServer = spawn(PYTHON, [PYTHON_SCRIPT, "--port", String(EMBED_SERVER_PORT)], {
+    stdio: ["ignore", "ignore", "pipe"],
+  })
+  pythonServer.stderr?.on("data", (d) => {
+    console.error(`[opencode-md-memory] embed server stderr: ${String(d).trim().slice(0, 200)}`)
+  })
+  for (let i = 0; i < 50; i++) {
+    await new Promise((r) => setTimeout(r, 200))
+    try {
+      const res = await fetch(`${url}/health`)
+      if (res.ok) return url
+    } catch {
+      /* retry */
+    }
+  }
+  pythonServer?.kill()
+  pythonServer = null
+  return null
+}
+
+/** Build an embedder that talks to the Python embed server. */
+function buildPythonEmbedder(base: string): Embedder {
+  const embedMany = async (texts: string[]): Promise<number[][]> => {
+    const res = await fetch(`${base}/embed`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ texts }),
+    })
+    if (!res.ok) throw new Error(`embed server ${res.status}`)
+    const data = (await res.json()) as { vectors: number[][] }
+    return data.vectors
+  }
   return {
     async embed(text: string): Promise<number[]> {
-      const out = await pipe(text, { pooling: "mean", normalize: true })
-      return Array.from(out.data as Float32Array)
+      const [v] = await embedMany([text])
+      return v
     },
     async embedMany(texts: string[]): Promise<number[][]> {
-      const out = await pipe(texts, { pooling: "mean", normalize: true })
-      const data = out.data as Float32Array
-      const dims = (out.dims as number[])[out.dims.length - 1]
-      const result: number[][] = []
-      for (let i = 0; i < texts.length; i++) {
-        result.push(Array.from(data.subarray(i * dims, (i + 1) * dims)))
-      }
-      return result
+      return embedMany(texts)
     },
   }
 }
@@ -410,7 +447,7 @@ function getEmbedder(config: ResolvedConfig): Promise<LoadResult | LoadFailure> 
   const key =
     config.embeddingBackend === "remote"
       ? `remote:${config.remoteApiUrl}:${config.remoteModel}`
-      : `local:${config.semanticModel}`
+      : `python:${EMBED_SERVER_PORT}`
   if (embedderState && embedderState.key === key) return embedderState.promise
   const promise = (async (): Promise<LoadResult | LoadFailure> => {
     if (config.embeddingBackend === "remote") {
@@ -430,10 +467,12 @@ function getEmbedder(config: ResolvedConfig): Promise<LoadResult | LoadFailure> 
       }
     }
     try {
-      return { ok: true, embedder: await buildLocalEmbedder(config.semanticModel) }
+      const base = await ensurePythonServer()
+      if (!base) return { ok: false, reason: "model" }
+      return { ok: true, embedder: buildPythonEmbedder(base) }
     } catch (e) {
-      const code = (e as { code?: string })?.code
-      return { ok: false, reason: code === "ERR_MODULE_NOT_FOUND" ? "deps" : "model" }
+      console.error(`[opencode-md-memory] python embedder failed: ${(e as Error)?.message?.slice(0, 200)}`)
+      return { ok: false, reason: "model" }
     }
   })()
   embedderState = { key, promise }
@@ -569,12 +608,12 @@ async function buildMemoryReference(
   if (!loaded.ok) {
     const reason =
       loaded.reason === "deps"
-        ? "injector skipped: @huggingface/transformers not installed. Run: npm i @huggingface/transformers onnxruntime-node"
+        ? "injector skipped: python embedding server unavailable. Ensure python3 with onnxruntime+tokenizers is installed (see python/embed_server.py)."
         : loaded.reason === "remote"
           ? config.remoteApiUrl
             ? `injector skipped: remote embeddings API "${config.remoteApiUrl}" failed. Check remoteApiUrl/remoteApiKey/remoteModel.`
             : `injector skipped: embeddingBackend is "remote" but remoteApiUrl is not set.`
-          : `injector skipped: embedding model "${config.semanticModel}" could not be loaded. Check network or configure semanticModel.`
+          : "injector skipped: local embedding model could not be loaded. Ensure python3 with onnxruntime+tokenizers (see python/embed_server.py)."
     log("warn", reason.replace(/^injector skipped: /, ""), { reason: loaded.reason })
     return null
   }

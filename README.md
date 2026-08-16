@@ -49,8 +49,8 @@ All options are optional; defaults are shown.
         "idPrefix": "mdm_",
         "maxReadSet": 200,
         "injectorEnabled": false,
-        "embeddingBackend": "local",
-        "semanticModel": "Xenova/all-MiniLM-L6-v2",
+        "embeddingBackend": "remote",
+        "semanticModel": "text-embedding-3-small",
         "remoteApiUrl": "https://api.openai.com/v1",
         "remoteApiKey": "{env:OPENAI_API_KEY}",
         "remoteModel": "text-embedding-3-small",
@@ -69,9 +69,9 @@ All options are optional; defaults are shown.
 | `storageRoot`         | string | —                           | Fixed absolute path for storage, e.g. `"~/.opencode-memory"`. When set, memories are stored there directly, independent of the project directory. Useful to share one memory store across projects. |
 | `idPrefix`            | string | `mdm_`                      | Prefix for memory file ids, e.g. `"mem_"` → `mem_1`.                         |
 | `maxReadSet`          | number | `200`                       | Max ids the read set remembers; older read records are evicted beyond this. |
-| `injectorEnabled`     | boolean| `false`                     | Inject memory references into chat via the `chat.message` hook. Requires embedding (local or remote). |
-| `embeddingBackend`    | string | `local`                     | `"local"` (transformers.js) or `"remote"` (OpenAI-compatible embeddings API). Use remote on machines that can't run local ONNX models. |
-| `semanticModel`       | string | `Xenova/all-MiniLM-L6-v2`   | Model id for the **local** backend.                                          |
+| `injectorEnabled`     | boolean| `false`                     | Inject memory references into chat via the `chat.message` hook. Requires embedding (python or remote). |
+| `embeddingBackend`    | string | `remote`                     | `"remote"` (OpenAI-compatible API) or `"python"` (local Python embed server). Use python for offline/local embeddings. |
+| `semanticModel`       | string | `text-embedding-3-small`     | Model id for the remote backend.                                                                    |
 | `remoteApiUrl`        | string | —                           | Base URL for the remote embeddings API, e.g. `https://api.openai.com/v1`.    |
 | `remoteApiKey`        | string | —                           | API key for remote embeddings. Supports `{env:VAR}` or `$VAR` to read from environment. |
 | `remoteModel`         | string | `text-embedding-3-small`    | Model id for the remote embeddings API.                                      |
@@ -91,17 +91,17 @@ When `injectorEnabled: true`, the plugin hooks `chat.message`. For each qualifyi
 
 It is **disabled by default**.
 
-**Local backend** (default): install the optional dependencies in your opencode config directory:
+**Remote backend** (default): set `embeddingBackend: "remote"` with `remoteApiUrl`, `remoteApiKey`, and `remoteModel`. The injector calls the OpenAI-compatible `/embeddings` endpoint. `remoteApiKey` accepts `{env:VAR}` or `$VAR` to read the key from the environment instead of storing it in `opencode.json`.
+
+**Python backend**: for local/offline embeddings, set `embeddingBackend: "python"`. The plugin spawns `python/embed_server.py` (bundled with the package), which loads an ONNX embedding model via onnxruntime + tokenizers and serves a local HTTP `/embed` endpoint. Requires:
 
 ```bash
-cd ~/.config/opencode && npm install @huggingface/transformers onnxruntime-node
+pip install onnxruntime tokenizers numpy
 ```
 
-The model (default `Xenova/all-MiniLM-L6-v2`) is downloaded on first use and cached locally.
+The model defaults to `~/.opencode-mem/data/.cache/Xenova/nomic-embed-text-v1` (override with `KB_EMBED_MODEL_DIR` or `EMBED_MODEL_DIR`). Use `PYTHON` env var to point at a specific interpreter if `python3` lacks the deps.
 
-**Remote backend**: on machines that can't run local ONNX models (e.g. Windows), set `embeddingBackend: "remote"` with `remoteApiUrl`, `remoteApiKey`, and `remoteModel`. The injector calls the OpenAI-compatible `/embeddings` endpoint and requires no local model dependencies. `remoteApiKey` accepts `{env:VAR}` or `$VAR` to read the key from the environment instead of storing it in `opencode.json`.
-
-If the deps (local) or the API (remote) are unavailable, the injector logs a warning and skips instead of failing the session.
+If the embed server (python) or the API (remote) are unavailable, the injector logs a warning and skips instead of failing the session.
 
 > **Index persistence**: only each memory's `id + title` (parsed from the filename) is embedded and stored in `.memory/.index/index.json`. On the first injection of a session the index is brought in sync with the current files incrementally — new files are embedded, deleted files are dropped, renamed files are re-embedded. Content changes never invalidate the index, so there is no re-embedding cost per edit. The index is a cache and is excluded from git via an auto-written `.memory/.gitignore`.
 

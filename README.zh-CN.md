@@ -49,8 +49,8 @@
         "idPrefix": "mdm_",
         "maxReadSet": 200,
         "injectorEnabled": false,
-        "embeddingBackend": "local",
-        "semanticModel": "Xenova/all-MiniLM-L6-v2",
+        "embeddingBackend": "remote",
+        "semanticModel": "text-embedding-3-small",
         "remoteApiUrl": "https://api.openai.com/v1",
         "remoteApiKey": "{env:OPENAI_API_KEY}",
         "remoteModel": "text-embedding-3-small",
@@ -70,8 +70,8 @@
 | `idPrefix`              | string | `mdm_`                        | 记忆文件 id 前缀，例如 `"mem_"` → `mem_1`。                                                      |
 | `maxReadSet`            | number | `200`                         | 已读集合记住的 id 上限；超出后最早的已读记录会被清除。                                            |
 | `injectorEnabled`       | boolean| `false`                       | 通过 `chat.message` hook 将记忆参考注入聊天。需要嵌入（本地或远程）。                            |
-| `embeddingBackend`      | string | `local`                       | `"local"`（transformers.js）或 `"remote"`（OpenAI 兼容 embeddings API）。无法运行本地 ONNX 模型的机器用 remote。 |
-| `semanticModel`         | string | `Xenova/all-MiniLM-L6-v2`     | **本地**后端的嵌入模型 id。                                                                      |
+| `embeddingBackend`      | string | `remote`                      | `"remote"`（OpenAI 兼容 API）或 `"python"`（本地 Python 嵌入服务）。本地/离线嵌入用 python。 |
+| `semanticModel`         | string | `text-embedding-3-small`      | 远程后端的嵌入模型 id。                                                                         |
 | `remoteApiUrl`          | string | —                             | 远程嵌入 API 的 Base URL，例如 `https://api.openai.com/v1`。                                     |
 | `remoteApiKey`          | string | —                             | 远程嵌入 API 密钥。支持 `{env:VAR}` 或 `$VAR` 从环境变量读取。                                    |
 | `remoteModel`           | string | `text-embedding-3-small`      | 远程嵌入 API 的模型 id。                                                                         |
@@ -91,17 +91,17 @@
 
 **默认关闭**。
 
-**本地后端**（默认）：在 opencode 配置目录安装可选依赖：
+**远程后端**（默认）：设置 `embeddingBackend: "remote"` 并配置 `remoteApiUrl`、`remoteApiKey`、`remoteModel`。注入器调用 OpenAI 兼容的 `/embeddings` 端点。`remoteApiKey` 支持 `{env:VAR}` 或 `$VAR` 从环境变量读取，避免明文存于 `opencode.json`。
+
+**Python 后端**：需要本地/离线嵌入时设置 `embeddingBackend: "python"`。插件会启动随包分发的 `python/embed_server.py`，通过 onnxruntime + tokenizers 加载本地 ONNX 模型，提供本地 HTTP `/embed` 接口。需要：
 
 ```bash
-cd ~/.config/opencode && npm install @huggingface/transformers onnxruntime-node
+pip install onnxruntime tokenizers numpy
 ```
 
-模型（默认 `Xenova/all-MiniLM-L6-v2`）首次使用时下载并本地缓存。
+模型默认指向 `~/.opencode-mem/data/.cache/Xenova/nomic-embed-text-v1`（可用 `KB_EMBED_MODEL_DIR` 或 `EMBED_MODEL_DIR` 覆盖）。若 `python3` 缺少依赖，可用 `PYTHON` 环境变量指定其他解释器。
 
-**远程后端**：无法运行本地 ONNX 模型的机器（如 Windows）可设置 `embeddingBackend: "remote"` 并配置 `remoteApiUrl`、`remoteApiKey`、`remoteModel`。注入器调用 OpenAI 兼容的 `/embeddings` 端点，无需本地模型依赖。`remoteApiKey` 支持 `{env:VAR}` 或 `$VAR` 从环境变量读取，避免明文存于 `opencode.json`。
-
-若依赖（本地）或 API（远程）不可用，注入器记录警告并跳过，不中断会话。
+若嵌入服务（python）或 API（remote）不可用，注入器记录警告并跳过，不中断会话。
 
 > **索引持久化**：仅将每条记忆的 `id + title`（从文件名解析）嵌入并存储到 `.memory/.index/index.json`。会话首次注入时，索引会与当前文件做增量同步——新文件嵌入追加、已删除文件移除、重命名文件重新嵌入。内容变更不会使索引失效，因此每次编辑都无需重嵌入。索引是缓存，通过自动写入的 `.memory/.gitignore` 排除在 git 之外。
 
