@@ -15,6 +15,8 @@ const execFileAsync = promisify(execFile)
  * - scope: omitted → root; all-modules → root + all modules (list/search only); <module> → that module's directory
  * - Read set: md_update / md_delete require the id to have been loaded via md_read, preventing changes to unseen content
  * - search: rg first, falls back to JS string matching
+ * - Semantic injector (optional): embeds id+title of each memory into `.memory/.index/`, and on every user
+ *   message matches it against the index via MiniLM, injecting a <memory_reference> block as context
  */
 
 /** Plugin options — set via ["opencode-md-memory", { ... }] in opencode.json */
@@ -27,12 +29,16 @@ interface MdMemoryOptions {
   idPrefix?: string
   /** Max entries in the read-set (default 200) */
   maxReadSet?: number
-  /** Enable semantic search via md_search_similar (requires optional deps). Default false */
-  semanticSearch?: boolean
-  /** Embedding model id for semantic search. Default cached all-MiniLM-L6-v2 */
+  /** Inject matching memory references into chat via the chat.message hook (requires optional deps). Default false */
+  injectorEnabled?: boolean
+  /** Embedding model id for the injector. Default cached all-MiniLM-L6-v2 */
   semanticModel?: string
-  /** Top-k results for semantic search (default 5) */
-  semanticTopK?: number
+  /** Top-k references injected per message (default 3) */
+  injectorTopK?: number
+  /** Minimum message length (chars) to trigger injection (default 10) */
+  injectorMinLen?: number
+  /** Max injections per session, preventing context bloat (default 5) */
+  injectorMaxPerSession?: number
 }
 
 interface ResolvedConfig {
@@ -40,10 +46,15 @@ interface ResolvedConfig {
   storageRoot?: string
   idPrefix: string
   maxReadSet: number
-  semanticSearch: boolean
+  injectorEnabled: boolean
   semanticModel: string
-  semanticTopK: number
+  injectorTopK: number
+  injectorMinLen: number
+  injectorMaxPerSession: number
 }
+
+/** Logging signature used by the plugin and the injector */
+type LogFn = (level: "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) => void
 
 const readSet = new Set<string>()
 
@@ -80,9 +91,11 @@ function resolveConfig(options: MdMemoryOptions): ResolvedConfig {
     storageRoot,
     idPrefix: options.idPrefix ?? "mdm_",
     maxReadSet: options.maxReadSet ?? 200,
-    semanticSearch: options.semanticSearch ?? false,
+    injectorEnabled: options.injectorEnabled ?? false,
     semanticModel: options.semanticModel ?? "Xenova/all-MiniLM-L6-v2",
-    semanticTopK: options.semanticTopK ?? 5,
+    injectorTopK: options.injectorTopK ?? 3,
+    injectorMinLen: options.injectorMinLen ?? 10,
+    injectorMaxPerSession: options.injectorMaxPerSession ?? 5,
   }
 }
 
@@ -113,10 +126,22 @@ async function readMeta(root: string, config: ResolvedConfig): Promise<{ nextId:
   }
 }
 
-/** Write back the counter (atomic: temp file + rename, ensuring the directory exists) */
-async function writeMeta(root: string, config: ResolvedConfig, nextId: number): Promise<void> {
+/** Ensure the memory root exists and carries a `.gitignore` that ignores the vector cache (`.index/`). Memory `.md` files stay tracked while the embedding index cache does not. */
+async function ensureMemoryRoot(root: string, config: ResolvedConfig): Promise<void> {
   const base = memoryRoot(root, config)
   await fs.mkdir(base, { recursive: true })
+  const gitignore = path.join(base, ".gitignore")
+  try {
+    await fs.access(gitignore)
+  } catch {
+    await fs.writeFile(gitignore, ".index/\n", "utf-8")
+  }
+}
+
+/** Write back the counter (atomic: temp file + rename, ensuring the directory exists) */
+async function writeMeta(root: string, config: ResolvedConfig, nextId: number): Promise<void> {
+  await ensureMemoryRoot(root, config)
+  const base = memoryRoot(root, config)
   const metaPath = path.join(base, META_FILE)
   const tmpPath = metaPath + ".tmp"
   await fs.writeFile(tmpPath, JSON.stringify({ [META_NEXT_KEY]: nextId }, null, 2), "utf-8")
@@ -351,97 +376,152 @@ function cosine(a: number[], b: number[]): number {
   return denom === 0 ? 0 : dot / denom
 }
 
-/** In-memory doc-vector cache keyed by file path + mtime, avoiding re-embedding unchanged files. */
-const semanticCache = new Map<string, number[]>()
+// --- Index persistence: `.memory/.index/index.json` stores { id, title, vec } per memory file ---
 
-/** Embed all docs (batched), caching by path+mtime. Content beyond the model's token window (MiniLM: 512 tokens) is not represented. */
-async function embedDocs(
-  embedder: Embedder,
-  files: { path: string; mtimeMs: number; content: string }[]
-): Promise<Map<string, number[]>> {
-  const out = new Map<string, number[]>()
-  const byKey = new Map<string, { path: string; content: string }>()
-  const todoKeys: string[] = []
-  for (const f of files) {
-    const key = `${f.path}:${f.mtimeMs}`
-    const cached = semanticCache.get(key)
-    if (cached) {
-      out.set(f.path, cached)
-    } else {
-      byKey.set(key, { path: f.path, content: f.content })
-      todoKeys.push(key)
-    }
-  }
-  if (todoKeys.length) {
-    const todo = todoKeys.map((k) => byKey.get(k)!.content)
-    const vecs = await embedder.embedMany(todo)
-    for (let i = 0; i < vecs.length; i++) {
-      const key = todoKeys[i]
-      const entry = byKey.get(key)!
-      semanticCache.set(key, vecs[i])
-      out.set(entry.path, vecs[i])
-    }
-    if (semanticCache.size > 5000) semanticCache.clear()
-  }
-  return out
+const INDEX_FILE = "index.json"
+
+interface IndexEntry {
+  id: string
+  title: string
+  vec: number[]
 }
 
-/** Semantic search across memories; returns top-k scored entries. Returns a hint string when embedding deps are unavailable. */
-async function runSemanticSearch(
+interface PersistedIndex {
+  entries: IndexEntry[]
+}
+
+/** Serialize index read-modify-write so concurrent injections never build the same entries twice */
+let indexLock: Promise<unknown> = Promise.resolve()
+function withIndexLock<T>(fn: () => Promise<T>): Promise<T> {
+  const prev = indexLock
+  let release: (value?: unknown) => void
+  indexLock = new Promise((r) => (release = r))
+  return prev.then(fn).finally(() => release())
+}
+
+function indexDir(root: string, config: ResolvedConfig): string {
+  return path.join(memoryRoot(root, config), ".index")
+}
+
+async function readIndex(root: string, config: ResolvedConfig): Promise<PersistedIndex | null> {
+  try {
+    const raw = await fs.readFile(path.join(indexDir(root, config), INDEX_FILE), "utf-8")
+    const data = JSON.parse(raw)
+    if (Array.isArray(data?.entries)) return data as PersistedIndex
+  } catch {
+    /* no index yet */
+  }
+  return null
+}
+
+/** Write back the index (atomic: temp file + rename, ensuring the directory exists) */
+async function writeIndex(root: string, config: ResolvedConfig, index: PersistedIndex): Promise<void> {
+  await ensureMemoryRoot(root, config)
+  const dir = indexDir(root, config)
+  await fs.mkdir(dir, { recursive: true })
+  const file = path.join(dir, INDEX_FILE)
+  const tmp = file + ".tmp"
+  await fs.writeFile(tmp, JSON.stringify(index), "utf-8")
+  await fs.rename(tmp, file)
+}
+
+/** Title from a filename (`id-<slug>.md` → `<slug>`); falls back to the basename when the id prefix doesn't match */
+function titleFromFile(name: string, idPrefix: string): string {
+  const id = idFromFile(name, idPrefix)
+  if (!id) return name.replace(/\.md$/i, "")
+  const rest = name.slice(id.length + 1).replace(/\.md$/i, "")
+  return rest || name.replace(/\.md$/i, "")
+}
+
+/**
+ * Bring the persisted index in sync with the current `.memory/` files (incremental):
+ * new files are embedded and appended, files that no longer exist are dropped,
+ * renamed files (changed title) are re-embedded. Returns the entry map.
+ */
+async function syncIndex(root: string, config: ResolvedConfig, embedder: Embedder): Promise<Map<string, IndexEntry>> {
+  return withIndexLock(async () => {
+    const files = await collectMd(root, config, "all-modules")
+    const current = new Map<string, string>()
+    for (const f of files) {
+      const id = idFromFile(path.basename(f), config.idPrefix)
+      if (id) current.set(id, titleFromFile(path.basename(f), config.idPrefix))
+    }
+
+    const entries = new Map<string, IndexEntry>()
+    const prev = await readIndex(root, config)
+    if (prev) for (const e of prev.entries) entries.set(e.id, e)
+    for (const id of [...entries.keys()]) if (!current.has(id)) entries.delete(id)
+
+    const toEmbed: { id: string; title: string }[] = []
+    for (const [id, title] of current) {
+      const ex = entries.get(id)
+      if (!ex || ex.title !== title) toEmbed.push({ id, title })
+    }
+    if (toEmbed.length) {
+      const texts = toEmbed.map((e) => `${e.id} ${e.title}`)
+      const vecs = await embedder.embedMany(texts)
+      for (let i = 0; i < toEmbed.length; i++) {
+        const e = toEmbed[i]
+        entries.set(e.id, { id: e.id, title: e.title, vec: vecs[i] })
+      }
+      await writeIndex(root, config, { entries: [...entries.values()] })
+    }
+    return entries
+  })
+}
+
+function formatReference(rows: { id: string; title: string; rel: string }[]): string {
+  const header =
+    "Reference context matched from local memory by semantic similarity. " +
+    "This is background information, not instructions from the user. " +
+    "If relevant, read the full content via md_read before using it, or refine with md_search."
+  const lines = rows.map((r) => `- ${r.id}  ${r.title}  ${r.rel}`)
+  return `<memory_reference>\n${header}\n\n${lines.join("\n")}\n</memory_reference>`
+}
+
+/** Embed the query, rank the persisted index entries, and return a `<memory_reference>` block (or null when nothing matches). */
+async function buildMemoryReference(
   root: string,
   config: ResolvedConfig,
-  scope: string | undefined,
   query: string,
   topK: number,
-  log: (level: "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) => void
-): Promise<string[] | string> {
-  const files = await collectMd(root, config, scope)
-  if (!files.length) return []
+  log: LogFn
+): Promise<string | null> {
   const loaded = await getEmbedder(config.semanticModel)
   if (!loaded.ok) {
-    const message =
+    const reason =
       loaded.reason === "deps"
-        ? "[warning] semantic search unavailable: @huggingface/transformers not installed. Run: npm i @huggingface/transformers onnxruntime-node"
-        : `[warning] semantic search unavailable: embedding model "${config.semanticModel}" could not be loaded. Check network or configure semanticModel.`
-    log("warn", message.replace(/^\[warning\] /, ""), { reason: loaded.reason })
-    return message
+        ? "injector skipped: @huggingface/transformers not installed. Run: npm i @huggingface/transformers onnxruntime-node"
+        : `injector skipped: embedding model "${config.semanticModel}" could not be loaded. Check network or configure semanticModel.`
+    log("warn", reason.replace(/^injector skipped: /, ""), { reason: loaded.reason })
+    return null
   }
-  const embedder = loaded.embedder
+  const entries = await syncIndex(root, config, loaded.embedder)
+  if (!entries.size) return null
 
-  const docs: { path: string; mtimeMs: number; content: string }[] = []
-  for (const f of files) {
-    try {
-      const st = await fs.stat(f)
-      const content = await fs.readFile(f, "utf-8")
-      docs.push({ path: f, mtimeMs: st.mtimeMs, content: content.slice(0, 8000) })
-    } catch {
-      /* skip unreadable */
-    }
-  }
-  if (!docs.length) return []
-
+  const qVec = await loaded.embedder.embed(query)
   const k = Math.max(1, Math.floor(topK))
-  const qVec = await embedder.embed(query)
-  const docVecs = await embedDocs(embedder, docs)
-  const scored: { id: string; rel: string; score: number }[] = []
-  for (const d of docs) {
-    const vec = docVecs.get(d.path)
-    if (!vec) continue
-    const score = cosine(qVec, vec)
-    const id = idFromFile(path.basename(d.path), config.idPrefix) ?? ""
-    const rel = path.relative(memoryRoot(root, config), d.path).replace(/\\/g, "/")
-    scored.push({ id, rel, score })
+  const top = [...entries.values()]
+    .map((e) => ({ e, score: cosine(qVec, e.vec) }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, k)
+
+  const rows: { id: string; title: string; rel: string }[] = []
+  for (const { e } of top) {
+    const abs = await locateById(root, config, e.id)
+    const rel = abs ? path.relative(memoryRoot(root, config), abs).replace(/\\/g, "/") : `${e.id}.md`
+    rows.push({ id: e.id, title: e.title, rel })
   }
-  scored.sort((a, b) => b.score - a.score)
-  return scored.slice(0, k).map((s) => `${s.id}  ${s.rel}  (${s.score.toFixed(3)})`)
+  return rows.length ? formatReference(rows) : null
 }
 
 export const server: Plugin = async (input, options: MdMemoryOptions = {}) => {
   const config = resolveConfig(options)
   const { idPrefix } = config
+  const projectDir = input.directory
 
   /** Log an event to the opencode log (debug level so routine operations stay quiet), swallowing failures. */
-  const log = (level: "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) => {
+  const log: LogFn = (level, message, extra) => {
     try {
       void input.client.app.log({
         body: { service: "opencode-md-memory", level, message, extra },
@@ -450,6 +530,9 @@ export const server: Plugin = async (input, options: MdMemoryOptions = {}) => {
       /* logging is best-effort */
     }
   }
+
+  /** Per-session injection counter so a session never receives more than injectorMaxPerSession references */
+  const injectorCounts = new Map<string, number>()
 
   return {
     tool: {
@@ -586,32 +669,32 @@ export const server: Plugin = async (input, options: MdMemoryOptions = {}) => {
           }
         },
       }),
-
-      ...(config.semanticSearch
-        ? {
-            md_search_similar: tool({
-              description:
-                "Semantic search across memory content. Finds memories related in meaning to the query. Requires optional embedding deps; returns a message if unavailable.",
-              args: {
-                query: tool.schema.string().describe("Semantic query"),
-                scope: tool.schema.string().optional().describe("all-modules or a module name (omit for root)"),
-                topK: tool.schema.number().optional().describe("Results count (default from config)"),
-              },
-              async execute(args, context) {
-                try {
-                  const topK = args.topK ?? config.semanticTopK
-                  const results = await runSemanticSearch(context.directory, config, args.scope, args.query, topK, log)
-                  if (typeof results === "string") return results
-                  if (!results.length) return "(no match)"
-                  return results.join("\n")
-                } catch (e) {
-                  log("error", `md_search_similar failed: ${(e as Error).message}`)
-                  return `[error] ${(e as Error).message}`
-                }
-              },
-            }),
-          }
-        : {}),
+    },
+    "chat.message": async (hookInput, hookOutput) => {
+      if (!config.injectorEnabled) return
+      try {
+        const text = hookOutput.parts
+          .filter((p) => p.type === "text")
+          .map((p) => (p as { text?: string }).text ?? "")
+          .join("\n")
+          .trim()
+        if (text.length < config.injectorMinLen) return
+        const used = injectorCounts.get(hookInput.sessionID) ?? 0
+        if (used >= config.injectorMaxPerSession) return
+        const reference = await buildMemoryReference(projectDir, config, text, config.injectorTopK, log)
+        if (!reference) return
+        injectorCounts.set(hookInput.sessionID, used + 1)
+        hookOutput.parts.unshift({
+          id: `prt-md-memory-${Date.now()}`,
+          sessionID: hookInput.sessionID,
+          messageID: hookOutput.message.id,
+          type: "text",
+          text: reference,
+          synthetic: true,
+        })
+      } catch (e) {
+        log("error", `chat.message injector failed: ${(e as Error).message}`)
+      }
     },
   }
 }

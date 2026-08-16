@@ -2,7 +2,7 @@
 
 基于本地 Markdown 文件的轻量记忆系统 — opencode 插件。
 
-无需向量数据库、无需 embedding、无自动清理 — 每条记忆就是一个 `.md` 文件，你可以直接阅读、编辑、搜索，并用 git 做版本管理。
+无需向量数据库、无自动清理 — 每条记忆就是一个 `.md` 文件，你可以直接阅读、编辑、搜索，并用 git 做版本管理。
 
 ## 功能特性
 
@@ -10,11 +10,11 @@
 - **稳定 ID** — 简短 id（`mdm_<n>`）内嵌文件名，无需维护索引
 - **按 ID 精确读取** — 直接按 id 读取记忆，无模糊匹配
 - **全文搜索** — 基于 `rg`（失败回退 JS 匹配），支持跨 scope
-- **语义搜索**（可选）— `md_search_similar` 按语义相关度召回，补充精确匹配
+- **语义参考注入**（可选）— 通过 `chat.message` hook 嵌入每条记忆的 `id + title`，将相关条目以 `<memory_reference>` 块注入上下文
 - **模块隔离** — 按模块子目录组织记忆
 - **已读集合** — update/delete 需先 read，避免修改从未看过的内容
 - **永久保留** — 不会自动清理；用 git 管理你的 `.memory/`
-- **零依赖** — 无 embedding 模型、无网络、无后台服务
+- **零必需依赖** — 嵌入器是可选的；核心功能无依赖、无网络
 
 ## 安装
 
@@ -48,40 +48,48 @@
         "storageRoot": null,
         "idPrefix": "mdm_",
         "maxReadSet": 200,
-        "semanticSearch": false,
+        "injectorEnabled": false,
         "semanticModel": "Xenova/all-MiniLM-L6-v2",
-        "semanticTopK": 5
+        "injectorTopK": 3,
+        "injectorMinLen": 10,
+        "injectorMaxPerSession": 5
       }
     ]
   ]
 }
 ```
 
-| 配置项           | 类型   | 默认值                        | 说明                                                                                     |
-|------------------|--------|-------------------------------|------------------------------------------------------------------------------------------|
-| `storageName`    | string | `.memory`                     | 项目根目录下的存储目录名。设置了 `storageRoot` 时忽略。                                  |
-| `storageRoot`    | string | —                             | 固定的存储绝对路径，例如 `"~/.opencode-memory"`。设置后记忆直接存于此路径，与项目目录无关，适合跨项目共享同一份记忆。 |
-| `idPrefix`       | string | `mdm_`                        | 记忆文件 id 前缀，例如 `"mem_"` → `mem_1`。                                              |
-| `maxReadSet`     | number | `200`                         | 已读集合记住的 id 上限；超出后最早的已读记录会被清除。                          |
-| `semanticSearch` | boolean| `false`                       | 启用语义搜索（`md_search_similar`）。需要安装可选嵌入依赖。                            |
-| `semanticModel`  | string | `Xenova/all-MiniLM-L6-v2`     | 语义搜索使用的嵌入模型 id。                                                             |
-| `semanticTopK`   | number | `5`                           | `md_search_similar` 返回的最大结果数。                                                  |
+| 配置项                | 类型   | 默认值                        | 说明                                                                                             |
+|-----------------------|--------|-------------------------------|--------------------------------------------------------------------------------------------------|
+| `storageName`         | string | `.memory`                     | 项目根目录下的存储目录名。设置了 `storageRoot` 时忽略。                                          |
+| `storageRoot`         | string | —                             | 固定的存储绝对路径，例如 `"~/.opencode-memory"`。设置后记忆直接存于此路径，与项目目录无关，适合跨项目共享同一份记忆。 |
+| `idPrefix`            | string | `mdm_`                        | 记忆文件 id 前缀，例如 `"mem_"` → `mem_1`。                                                      |
+| `maxReadSet`          | number | `200`                         | 已读集合记住的 id 上限；超出后最早的已读记录会被清除。                                            |
+| `injectorEnabled`     | boolean| `false`                       | 通过 `chat.message` hook 将记忆参考注入聊天。需要安装可选嵌入依赖。                              |
+| `semanticModel`       | string | `Xenova/all-MiniLM-L6-v2`     | 注入器使用的嵌入模型 id。                                                                        |
+| `injectorTopK`        | number | `3`                           | 每次触发注入的最大参考条目数。                                                                   |
+| `injectorMinLen`      | number | `10`                          | 触发注入的最小消息长度（字符）；更短的消息跳过。                                                 |
+| `injectorMaxPerSession` | number | `5`                         | 每个会话的最大注入次数，防止上下文膨胀。                                                          |
 
 > `storageRoot` 支持 `~`（展开为用户主目录）。设置后记忆直接存储在指定位置，与项目目录无关，而非 `<项目>/.memory/`。
 
-### 语义搜索
+### 语义参考注入
 
-`md_search_similar` 按**语义相关度**查找记忆，补充精确匹配的 `md_search`。**默认关闭**，仅当 `semanticSearch: true` 时注册该工具。
+当 `injectorEnabled: true` 时，插件挂载 `chat.message` hook。对每条符合条件的用户消息：
 
-启用需在 opencode 配置目录安装可选依赖：
+1. 用 MiniLM 嵌入消息，并在持久化索引（每条记忆按 `id + title` 索引）上排序。
+2. 在消息前插入 `<memory_reference>` 块，列出 top-k 匹配条目（`id + title + 路径`），并明确标注这是**参考上下文，而非用户指令**。
+3. 由 Agent 决定是否用 `md_read` / `md_search` 跟进读取原文；语义匹配**只做触发，不做最终检索**。
+
+**默认关闭**。启用需在 opencode 配置目录安装可选依赖：
 
 ```bash
 cd ~/.config/opencode && npm install @huggingface/transformers onnxruntime-node
 ```
 
-嵌入模型（默认 `Xenova/all-MiniLM-L6-v2`）首次使用时下载并本地缓存。若依赖或模型不可用，`md_search_similar` 返回提示而非中断会话。
+嵌入模型（默认 `Xenova/all-MiniLM-L6-v2`）首次使用时下载并本地缓存。若依赖或模型不可用，注入器记录警告并跳过，不中断会话。
 
-> **Token 窗口**：每条记忆仅嵌入前 ~512 token（MiniLM 上下文限制）。超出窗口的内容语义搜索找不到，`md_search`（全文）仍能找到。文档向量按文件 mtime 内存缓存，文件变更时才重新计算。
+> **索引持久化**：仅将每条记忆的 `id + title`（从文件名解析）嵌入并存储到 `.memory/.index/index.json`。会话首次注入时，索引会与当前文件做增量同步——新文件嵌入追加、已删除文件移除、重命名文件重新嵌入。内容变更不会使索引失效，因此每次编辑都无需重嵌入。索引是缓存，通过自动写入的 `.memory/.gitignore` 排除在 git 之外。
 
 ## 工具
 
@@ -93,24 +101,26 @@ cd ~/.config/opencode && npm install @huggingface/transformers onnxruntime-node
 | `md_delete` | 删除指定 id 的记忆。需该 id 在已读集合中。                        |
 | `md_list`   | 列出记忆文件。                                                     |
 | `md_search` | 全文搜索记忆内容。                                                 |
-| `md_search_similar` | 语义搜索记忆内容。仅 `semanticSearch: true` 时注册。      |
 
 ## 核心设计
 
 - **id 化**：简短 id（`mdm_<n>`）内嵌文件名开头，从文件名解析，无需索引映射
 - **scope**：省略→根目录；`all-modules`→根+所有模块；`<module>`→该模块一级目录
 - **已读集合**：`md_update` / `md_delete` 需该 id 已通过 `md_read` 载入，防止修改或删除从未看过的内容
-- **搜索**：`rg` 优先，失败回退 JS 字符串匹配；可选语义搜索 `md_search_similar`
-- **存储**：`<项目>/.memory/`，atomic 计数器
+- **搜索**：`rg` 优先，失败回退 JS 字符串匹配
+- **存储**：`<项目>/.memory/`，atomic 计数器；语义索引在 `.memory/.index/`（git 忽略）
 
 ## 存储结构
 
 ```
 .memory/
-├── meta.json              # 计数器 { "next_id": N }
-├── mdm_1-<slug>.md        # 根目录（省略 scope）
+├── .gitignore           # 自动写入：忽略 ".index/"
+├── .index/              # 语义索引缓存（git 忽略）
+│   └── index.json       # { entries: [{ id, title, vec }] }
+├── meta.json            # 计数器 { "next_id": N }
+├── mdm_1-<slug>.md      # 根目录（省略 scope）
 └── cell-trace/
-    └── mdm_2-<slug>.md    # 模块 scope
+    └── mdm_2-<slug>.md  # 模块 scope
 ```
 
 ## 使用示例
@@ -142,7 +152,7 @@ md_list({ scope: "cell-trace" })
 - 人类可读，可在 opencode 之外直接编辑
 - 对 git 友好：diff、历史、协作开箱即用
 - 用标准工具即可全文搜索（`rg`、`grep`、你的编辑器）
-- 无后台服务、无 embedding 模型、无网络请求
+- 无后台服务、无网络请求（核心功能）；嵌入（可选）仅注入器运行时才会执行
 
 ## License
 
