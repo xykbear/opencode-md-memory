@@ -56,9 +56,9 @@ All options are optional; defaults are shown.
 | Option        | Type   | Default    | Description                                                                 |
 |---------------|--------|------------|-----------------------------------------------------------------------------|
 | `storageName` | string | `.memory`  | Directory name under the project root. Ignored when `storageRoot` is set.   |
-| `storageRoot` | string | —          | Fixed absolute path for storage. Overrides the project-relative default, e.g. `"~/.opencode-memory"`. Useful to share one memory store across projects. |
+| `storageRoot` | string | —          | Fixed absolute path for storage, e.g. `"~/.opencode-memory"`. When set, memories are stored there directly, independent of the project directory. Useful to share one memory store across projects. |
 | `idPrefix`    | string | `mdm_`     | Prefix for memory file ids, e.g. `"mem_"` → `mem_1`.                         |
-| `maxReadSet`  | number | `200`      | Max ids tracked as "read"; the write gate (update/delete require a prior read) only remembers this many. |
+| `maxReadSet`  | number | `200`      | Max "read" ids the write gate remembers; older read records are evicted beyond this. |
 
 > `storageRoot` accepts `~` (expanded to the home directory). When set, memories are stored there directly instead of under `<project>/.memory/`.
 
