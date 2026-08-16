@@ -1,6 +1,7 @@
 import { type Plugin, tool } from "@opencode-ai/plugin"
 import { promises as fs } from "fs"
 import * as path from "path"
+import * as os from "os"
 import { execFile } from "child_process"
 import { promisify } from "util"
 
@@ -9,23 +10,55 @@ const execFileAsync = promisify(execFile)
 /**
  * opencode-md-memory — Lightweight memory system based on local Markdown files.
  *
- * - Storage root: <current project directory>/.memory/ (located via context.directory)
+ * - Storage root: <current project directory>/.memory/ by default, or a fixed path via `storageRoot`
  * - ID-based: short ids (mdm_<n>) embedded at the start of filenames, parsed from filenames — no index mapping
  * - scope: omitted → root; all-modules → root + all modules (list/search only); <module> → that module's directory
  * - Gate: md_update / md_delete require a prior md_read of the file, otherwise rejected
  * - search: rg first, falls back to JS string matching
  */
 
+/** Plugin options — set via ["opencode-md-memory", { ... }] in opencode.json */
+interface MdMemoryOptions {
+  /** Directory name under the project root (default ".memory") */
+  storageName?: string
+  /** Fixed absolute path for storage. When set, overrides the project-relative default */
+  storageRoot?: string
+  /** Id prefix for memory files (default "mdm_") */
+  idPrefix?: string
+  /** Max entries in the read-set (write-gate window, default 200) */
+  maxReadSet?: number
+}
+
+interface ResolvedConfig {
+  storageName: string
+  storageRoot?: string
+  idPrefix: string
+  maxReadSet: number
+}
+
 const readSet = new Set<string>()
-const MAX_READ_SET = 200
 
 const META_FILE = "meta.json"
-const ID_PREFIX = "mdm_"
 const META_NEXT_KEY = "next_id"
 
-/** Absolute path of the current .memory/ root */
-function memoryRoot(root: string): string {
-  return path.join(root, ".memory")
+function resolveConfig(options: MdMemoryOptions): ResolvedConfig {
+  const storageName = options.storageName?.replace(/[\\/]+$/, "") ?? ".memory"
+  if (!storageName) throw new Error("[config] storageName must not be empty")
+  let storageRoot = options.storageRoot
+  if (storageRoot && storageRoot.startsWith("~/")) {
+    storageRoot = path.join(os.homedir(), storageRoot.slice(2))
+  }
+  return {
+    storageName,
+    storageRoot,
+    idPrefix: options.idPrefix ?? "mdm_",
+    maxReadSet: options.maxReadSet ?? 200,
+  }
+}
+
+/** Absolute path of the memory root (fixed path if configured, else under project root) */
+function memoryRoot(root: string, config: ResolvedConfig): string {
+  return config.storageRoot ?? path.join(root, config.storageName)
 }
 
 /** Validate scope: only omitted (undefined → root) or a single-level module name; all-modules is list/search only */
@@ -39,18 +72,18 @@ function scopeLabel(scope?: string): string | null {
 }
 
 /** Resolve a .memory path relative to cwd, blocking path traversal */
-function resolveInMemory(root: string, rel: string): string {
-  const base = memoryRoot(root)
+function resolveInMemory(root: string, config: ResolvedConfig, rel: string): string {
+  const base = memoryRoot(root, config)
   const abs = path.resolve(base, rel)
   if (abs !== base && !abs.startsWith(base + path.sep)) {
-    throw new Error(`invalid path ${rel}: must stay inside the .memory/ directory`)
+    throw new Error(`invalid path ${rel}: must stay inside the memory directory`)
   }
   return abs
 }
 
 /** Read the counter (initialized to 1 if missing) */
-async function readMeta(root: string): Promise<{ nextId: number }> {
-  const metaPath = path.join(memoryRoot(root), META_FILE)
+async function readMeta(root: string, config: ResolvedConfig): Promise<{ nextId: number }> {
+  const metaPath = path.join(memoryRoot(root, config), META_FILE)
   try {
     const raw = await fs.readFile(metaPath, "utf-8")
     const data = JSON.parse(raw)
@@ -61,8 +94,8 @@ async function readMeta(root: string): Promise<{ nextId: number }> {
 }
 
 /** Write back the counter (atomic: temp file + rename, ensuring the directory exists) */
-async function writeMeta(root: string, nextId: number): Promise<void> {
-  const base = memoryRoot(root)
+async function writeMeta(root: string, config: ResolvedConfig, nextId: number): Promise<void> {
+  const base = memoryRoot(root, config)
   await fs.mkdir(base, { recursive: true })
   const metaPath = path.join(base, META_FILE)
   const tmpPath = metaPath + ".tmp"
@@ -70,9 +103,9 @@ async function writeMeta(root: string, nextId: number): Promise<void> {
   await fs.rename(tmpPath, metaPath)
 }
 
-/** List all first-level directory names (module scopes) under .memory, excluding root */
-async function listScopes(root: string): Promise<string[]> {
-  const base = memoryRoot(root)
+/** List all first-level directory names (module scopes) under the memory root, excluding the root itself */
+async function listScopes(root: string, config: ResolvedConfig): Promise<string[]> {
+  const base = memoryRoot(root, config)
   const out: string[] = []
   try {
     const entries = await fs.readdir(base, { withFileTypes: true })
@@ -86,8 +119,8 @@ async function listScopes(root: string): Promise<string[]> {
 }
 
 /** Collect all .md file paths under the given scope (excluding meta.json). See scopeLabel */
-async function collectMd(root: string, scope?: string): Promise<string[]> {
-  const base = memoryRoot(root)
+async function collectMd(root: string, config: ResolvedConfig, scope?: string): Promise<string[]> {
+  const base = memoryRoot(root, config)
   const dirs: string[] = []
   const rootScope = scopeLabel(scope)
   if (rootScope === null) {
@@ -96,7 +129,7 @@ async function collectMd(root: string, scope?: string): Promise<string[]> {
   }
   if (scope === "all-modules") {
     // add all module directories
-    for (const s of await listScopes(root)) dirs.push(path.join(base, s))
+    for (const s of await listScopes(root, config)) dirs.push(path.join(base, s))
   } else if (rootScope !== null) {
     dirs.push(path.join(base, rootScope))
   }
@@ -117,18 +150,18 @@ async function collectMd(root: string, scope?: string): Promise<string[]> {
 }
 
 /** Parse an id from a filename (mdm_<n>-<slug>.md → mdm_<n>) */
-function idFromFile(name: string): string | null {
+function idFromFile(name: string, idPrefix: string): string | null {
   const dash = name.indexOf("-")
   if (dash <= 0) return null
   const prefix = name.slice(0, dash)
-  return prefix.startsWith(ID_PREFIX) ? prefix : null
+  return prefix.startsWith(idPrefix) ? prefix : null
 }
 
 /** Global lookup: given an id, find <id>-*.md across root and all module dirs */
-async function locateById(root: string, id: string): Promise<string | null> {
-  const base = memoryRoot(root)
+async function locateById(root: string, config: ResolvedConfig, id: string): Promise<string | null> {
+  const base = memoryRoot(root, config)
   const dirs = [base]
-  for (const s of await listScopes(root)) dirs.push(path.join(base, s))
+  for (const s of await listScopes(root, config)) dirs.push(path.join(base, s))
   for (const dir of dirs) {
     let entries
     try {
@@ -146,18 +179,18 @@ async function locateById(root: string, id: string): Promise<string | null> {
 }
 
 /** Generate the next unique id, incrementing on filename conflicts (covers externally reset counters) */
-async function allocateId(root: string, slug: string, scopeDir: string | null): Promise<string> {
-  await fs.mkdir(scopeDir ? path.join(memoryRoot(root), scopeDir) : memoryRoot(root), {
+async function allocateId(root: string, config: ResolvedConfig, slug: string, scopeDir: string | null): Promise<string> {
+  await fs.mkdir(scopeDir ? path.join(memoryRoot(root, config), scopeDir) : memoryRoot(root, config), {
     recursive: true,
   })
-  const meta = await readMeta(root)
+  const meta = await readMeta(root, config)
   let n = meta.nextId
   let id = ""
   for (;;) {
-    id = `${ID_PREFIX}${n}`
+    id = `${config.idPrefix}${n}`
     const target = scopeDir
-      ? path.join(memoryRoot(root), scopeDir, `${id}-${slug}.md`)
-      : path.join(memoryRoot(root), `${id}-${slug}.md`)
+      ? path.join(memoryRoot(root, config), scopeDir, `${id}-${slug}.md`)
+      : path.join(memoryRoot(root, config), `${id}-${slug}.md`)
     try {
       await fs.access(target)
       n += 1 // conflict, keep incrementing (covers externally reset counter)
@@ -165,14 +198,14 @@ async function allocateId(root: string, slug: string, scopeDir: string | null): 
       break
     }
   }
-  await writeMeta(root, n + 1)
+  await writeMeta(root, config, n + 1)
   return id
 }
 
 /** rg search (rg first, falls back to JS string matching) */
-async function runSearch(root: string, scope: string | undefined, query: string): Promise<string[]> {
-  const base = memoryRoot(root)
-  const files = await collectMd(root, scope)
+async function runSearch(root: string, config: ResolvedConfig, scope: string | undefined, query: string): Promise<string[]> {
+  const base = memoryRoot(root, config)
+  const files = await collectMd(root, config, scope)
   if (!files.length) return []
 
   // prefer rg (sorted by line number, output id + relative path + matched line)
@@ -197,7 +230,7 @@ async function runSearch(root: string, scope: string | undefined, query: string)
     }
     const out: string[] = []
     for (const [rel, hits] of grouped) {
-      const id = idFromFile(path.basename(rel)) ?? ""
+      const id = idFromFile(path.basename(rel), config.idPrefix) ?? ""
       out.push(`--- ${id} (${rel.replace(/\\/g, "/")}) ---\n${hits.join("\n")}`)
     }
     return out
@@ -213,7 +246,7 @@ async function runSearch(root: string, scope: string | undefined, query: string)
       const content = await fs.readFile(f, "utf-8")
       if (!content.toLowerCase().includes(q)) continue
       const rel = path.relative(base, f).replace(/\\/g, "/")
-      const id = idFromFile(path.basename(f)) ?? ""
+      const id = idFromFile(path.basename(f), config.idPrefix) ?? ""
       const hits = content
         .split("\n")
         .map((l, i) => (l.toLowerCase().includes(q) ? `${i + 1}: ${l.trim().slice(0, 120)}` : null))
@@ -226,7 +259,10 @@ async function runSearch(root: string, scope: string | undefined, query: string)
   return out
 }
 
-export const server: Plugin = async () => {
+export const server: Plugin = async (_input, options: MdMemoryOptions = {}) => {
+  const config = resolveConfig(options)
+  const { idPrefix } = config
+
   return {
     tool: {
       md_create: tool({
@@ -245,10 +281,10 @@ export const server: Plugin = async () => {
               return `[error] name must not contain / \\ or :${args.name}`
             }
             const scopeDir = scopeLabel(args.scope)
-            const id = await allocateId(context.directory, args.name, scopeDir)
+            const id = await allocateId(context.directory, config, args.name, scopeDir)
             const target = scopeDir
-              ? path.join(memoryRoot(context.directory), scopeDir, `${id}-${args.name}.md`)
-              : path.join(memoryRoot(context.directory), `${id}-${args.name}.md`)
+              ? path.join(memoryRoot(context.directory, config), scopeDir, `${id}-${args.name}.md`)
+              : path.join(memoryRoot(context.directory, config), `${id}-${args.name}.md`)
             await fs.writeFile(target, args.content, "utf-8")
             return `created ${id} (${scopeDir ? scopeDir + "/" : ""}${id}-${args.name}.md)`
           } catch (e) {
@@ -264,11 +300,11 @@ export const server: Plugin = async () => {
         },
         async execute(args, context) {
           try {
-            const abs = await locateById(context.directory, args.id)
+            const abs = await locateById(context.directory, config, args.id)
             if (!abs) return `[error] id=${args.id} not found`
             const content = await fs.readFile(abs, "utf-8")
             readSet.add(args.id)
-            if (readSet.size > MAX_READ_SET) {
+            if (readSet.size > config.maxReadSet) {
               const half = [...readSet].slice(0, Math.floor(readSet.size / 2))
               for (const id of half) readSet.delete(id)
             }
@@ -290,7 +326,7 @@ export const server: Plugin = async () => {
             if (!readSet.has(args.id)) {
               return `[gate denied] id=${args.id} was not read. Call md_read first, then update.`
             }
-            const abs = await locateById(context.directory, args.id)
+            const abs = await locateById(context.directory, config, args.id)
             if (!abs) return `[error] id=${args.id} not found`
             await fs.writeFile(abs, args.content, "utf-8")
             return `updated ${args.id}`
@@ -310,7 +346,7 @@ export const server: Plugin = async () => {
             if (!readSet.has(args.id)) {
               return `[gate denied] id=${args.id} was not read. Call md_read first, then delete.`
             }
-            const abs = await locateById(context.directory, args.id)
+            const abs = await locateById(context.directory, config, args.id)
             if (!abs) return `[error] id=${args.id} not found`
             await fs.unlink(abs)
             readSet.delete(args.id)
@@ -328,12 +364,12 @@ export const server: Plugin = async () => {
         },
         async execute(args, context) {
           try {
-            const files = await collectMd(context.directory, args.scope)
+            const files = await collectMd(context.directory, config, args.scope)
             if (!files.length) return "(empty)"
             return files
               .map((f) => {
-                const id = idFromFile(path.basename(f))
-                const rel = path.relative(memoryRoot(context.directory), f).replace(/\\/g, "/")
+                const id = idFromFile(path.basename(f), idPrefix)
+                const rel = path.relative(memoryRoot(context.directory, config), f).replace(/\\/g, "/")
                 return id ? `${id}  ${rel}` : rel
               })
               .join("\n")
@@ -351,7 +387,7 @@ export const server: Plugin = async () => {
         },
         async execute(args, context) {
           try {
-            const results = await runSearch(context.directory, args.scope, args.query)
+            const results = await runSearch(context.directory, config, args.scope, args.query)
             return results.length ? results.join("\n\n") : "(no match)"
           } catch (e) {
             return `[error] ${(e as Error).message}`

@@ -33,6 +33,35 @@ Add to `~/.config/opencode/opencode.json`:
 
 Then restart opencode.
 
+## Configuration
+
+All options are optional; defaults are shown.
+
+```json
+{
+  "plugin": [
+    [
+      "opencode-md-memory",
+      {
+        "storageName": ".memory",
+        "storageRoot": null,
+        "idPrefix": "mdm_",
+        "maxReadSet": 200
+      }
+    ]
+  ]
+}
+```
+
+| Option        | Type   | Default    | Description                                                                 |
+|---------------|--------|------------|-----------------------------------------------------------------------------|
+| `storageName` | string | `.memory`  | Directory name under the project root. Ignored when `storageRoot` is set.   |
+| `storageRoot` | string | —          | Fixed absolute path for storage. Overrides the project-relative default, e.g. `"~/.opencode-memory"`. Useful to share one memory store across projects. |
+| `idPrefix`    | string | `mdm_`     | Prefix for memory file ids, e.g. `"mem_"` → `mem_1`.                         |
+| `maxReadSet`  | number | `200`      | Max ids tracked as "read"; the write gate (update/delete require a prior read) only remembers this many. |
+
+> `storageRoot` accepts `~` (expanded to the home directory). When set, memories are stored there directly instead of under `<project>/.memory/`.
+
 ## Tools
 
 | Tool       | Description                                                                 |

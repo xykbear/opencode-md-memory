@@ -33,6 +33,35 @@
 
 然后重启 opencode。
 
+## 配置项
+
+所有配置项均为可选，以下为默认值：
+
+```json
+{
+  "plugin": [
+    [
+      "opencode-md-memory",
+      {
+        "storageName": ".memory",
+        "storageRoot": null,
+        "idPrefix": "mdm_",
+        "maxReadSet": 200
+      }
+    ]
+  ]
+}
+```
+
+| 配置项        | 类型   | 默认值      | 说明                                                                                     |
+|---------------|--------|-------------|------------------------------------------------------------------------------------------|
+| `storageName` | string | `.memory`   | 项目根目录下的存储目录名。设置了 `storageRoot` 时忽略。                                  |
+| `storageRoot` | string | —           | 固定的存储绝对路径，覆盖项目相对路径默认值，例如 `"~/.opencode-memory"`。适合跨项目共享同一份记忆。 |
+| `idPrefix`    | string | `mdm_`      | 记忆文件 id 前缀，例如 `"mem_"` → `mem_1`。                                              |
+| `maxReadSet`  | number | `200`       | 跟踪为「已读」的最大 id 数；写入门禁（update/delete 需先 read）只记住这么多条。          |
+
+> `storageRoot` 支持 `~`（展开为家目录）。设置后记忆直接存储在指定位置，而非 `<项目>/.memory/`。
+
 ## 工具
 
 | 工具       | 描述                                                               |
