@@ -1,7 +1,7 @@
 {
   "name": "opencode-md-memory",
   "version": "1.0.0",
-  "description": "A lightweight, local-first memory system for opencode backed by plain Markdown files. Short ids, module scoping, rg full-text search, write gate.",
+  "description": "A lightweight, local-first memory system for opencode backed by plain Markdown files. Short ids, module scoping, rg full-text search, read-set gate.",
   "type": "module",
   "main": "index.ts",
   "files": [

@@ -25,7 +25,7 @@ interface MdMemoryOptions {
   storageRoot?: string
   /** Id prefix for memory files (default "mdm_") */
   idPrefix?: string
-  /** Max entries in the read-set (write-gate window, default 200) */
+  /** Max entries in the read-set (default 200) */
   maxReadSet?: number
 }
 
@@ -37,6 +37,24 @@ interface ResolvedConfig {
 }
 
 const readSet = new Set<string>()
+
+/** Add an id to the read set, evicting the oldest half when it exceeds the configured cap */
+function addToReadSet(id: string, max: number): void {
+  readSet.add(id)
+  if (readSet.size > max) {
+    const half = [...readSet].slice(0, Math.floor(readSet.size / 2))
+    for (const old of half) readSet.delete(old)
+  }
+}
+
+/** Serialize counter read-modify-write so concurrent md_create calls never read the same next id */
+let idLock: Promise<unknown> = Promise.resolve()
+function withIdLock<T>(fn: () => Promise<T>): Promise<T> {
+  const prev = idLock
+  let release: (value?: unknown) => void
+  idLock = new Promise((r) => (release = r))
+  return prev.then(fn).finally(() => release())
+}
 
 const META_FILE = "meta.json"
 const META_NEXT_KEY = "next_id"
@@ -69,16 +87,6 @@ function scopeLabel(scope?: string): string | null {
     throw new Error(`invalid scope ${scope}: only a single-level module name is allowed`)
   }
   return scope
-}
-
-/** Resolve a .memory path relative to cwd, blocking path traversal */
-function resolveInMemory(root: string, config: ResolvedConfig, rel: string): string {
-  const base = memoryRoot(root, config)
-  const abs = path.resolve(base, rel)
-  if (abs !== base && !abs.startsWith(base + path.sep)) {
-    throw new Error(`invalid path ${rel}: must stay inside the memory directory`)
-  }
-  return abs
 }
 
 /** Read the counter (initialized to 1 if missing) */
@@ -178,28 +186,30 @@ async function locateById(root: string, config: ResolvedConfig, id: string): Pro
   return null
 }
 
-/** Generate the next unique id, incrementing on filename conflicts (covers externally reset counters) */
-async function allocateId(root: string, config: ResolvedConfig, slug: string, scopeDir: string | null): Promise<string> {
-  await fs.mkdir(scopeDir ? path.join(memoryRoot(root, config), scopeDir) : memoryRoot(root, config), {
-    recursive: true,
-  })
-  const meta = await readMeta(root, config)
-  let n = meta.nextId
-  let id = ""
-  for (;;) {
-    id = `${config.idPrefix}${n}`
-    const target = scopeDir
-      ? path.join(memoryRoot(root, config), scopeDir, `${id}-${slug}.md`)
-      : path.join(memoryRoot(root, config), `${id}-${slug}.md`)
-    try {
-      await fs.access(target)
-      n += 1 // conflict, keep incrementing (covers externally reset counter)
-    } catch {
-      break
+/** Generate the next unique id, incrementing on filename conflicts (covers externally reset counters). Serialized via idLock to stay safe under concurrent md_create calls. */
+function allocateId(root: string, config: ResolvedConfig, slug: string, scopeDir: string | null): Promise<string> {
+  return withIdLock(async () => {
+    await fs.mkdir(scopeDir ? path.join(memoryRoot(root, config), scopeDir) : memoryRoot(root, config), {
+      recursive: true,
+    })
+    const meta = await readMeta(root, config)
+    let n = meta.nextId
+    let id = ""
+    for (;;) {
+      id = `${config.idPrefix}${n}`
+      const target = scopeDir
+        ? path.join(memoryRoot(root, config), scopeDir, `${id}-${slug}.md`)
+        : path.join(memoryRoot(root, config), `${id}-${slug}.md`)
+      try {
+        await fs.access(target)
+        n += 1 // conflict, keep incrementing (covers externally reset counter)
+      } catch {
+        break
+      }
     }
-  }
-  await writeMeta(root, config, n + 1)
-  return id
+    await writeMeta(root, config, n + 1)
+    return id
+  })
 }
 
 /** rg search (rg first, falls back to JS string matching) */
@@ -208,12 +218,12 @@ async function runSearch(root: string, config: ResolvedConfig, scope: string | u
   const files = await collectMd(root, config, scope)
   if (!files.length) return []
 
-  // prefer rg (sorted by line number, output id + relative path + matched line)
+  // prefer rg (-F literal matching, matching the JS fallback semantics below)
   try {
     const rels = files.map((f) => path.relative(base, f))
     const { stdout } = await execFileAsync(
       "rg",
-      ["-i", "-n", "--no-heading", "--color", "never", "--with-filename", "-e", query, ...rels],
+      ["-i", "-n", "-F", "--no-heading", "--color", "never", "--with-filename", "-e", query, ...rels],
       { cwd: base, encoding: "utf8", maxBuffer: 10 * 1024 * 1024 }
     )
     const lines = stdout.split("\n").filter(Boolean)
@@ -280,12 +290,16 @@ export const server: Plugin = async (_input, options: MdMemoryOptions = {}) => {
             if (args.name.includes("/") || args.name.includes("\\") || args.name.includes(":")) {
               return `[error] name must not contain / \\ or :${args.name}`
             }
+            if (!args.name.trim()) {
+              return `[error] name must not be empty.`
+            }
             const scopeDir = scopeLabel(args.scope)
             const id = await allocateId(context.directory, config, args.name, scopeDir)
             const target = scopeDir
               ? path.join(memoryRoot(context.directory, config), scopeDir, `${id}-${args.name}.md`)
               : path.join(memoryRoot(context.directory, config), `${id}-${args.name}.md`)
             await fs.writeFile(target, args.content, "utf-8")
+            addToReadSet(id, config.maxReadSet)
             return `created ${id} (${scopeDir ? scopeDir + "/" : ""}${id}-${args.name}.md)`
           } catch (e) {
             return `[error] ${(e as Error).message}`
@@ -303,11 +317,7 @@ export const server: Plugin = async (_input, options: MdMemoryOptions = {}) => {
             const abs = await locateById(context.directory, config, args.id)
             if (!abs) return `[error] id=${args.id} not found`
             const content = await fs.readFile(abs, "utf-8")
-            readSet.add(args.id)
-            if (readSet.size > config.maxReadSet) {
-              const half = [...readSet].slice(0, Math.floor(readSet.size / 2))
-              for (const id of half) readSet.delete(id)
-            }
+            addToReadSet(args.id, config.maxReadSet)
             return content
           } catch (e) {
             return `[error] ${(e as Error).message}`
