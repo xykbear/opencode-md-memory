@@ -99,7 +99,7 @@
 pip install onnxruntime tokenizers numpy
 ```
 
-模型默认指向 `~/.opencode-mem/data/.cache/Xenova/nomic-embed-text-v1`（可用 `KB_EMBED_MODEL_DIR` 或 `EMBED_MODEL_DIR` 覆盖）。若 `python3` 缺少依赖，可用 `PYTHON` 环境变量指定其他解释器。
+模型默认指向 `~/.opencode-md-memory/models/nomic-embed-text-v1`——从 Hugging Face 下载 `Xenova/nomic-embed-text-v1` 解压到该目录即可。若模型在其他位置，用 `MDM_EMBED_MODEL_DIR`（或 `EMBED_MODEL_DIR`）覆盖。若 `python3` 缺少依赖，可用 `PYTHON` 环境变量指定其他解释器。
 
 若嵌入服务（python）或 API（remote）不可用，注入器记录警告并跳过，不中断会话。
 

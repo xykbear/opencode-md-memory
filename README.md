@@ -99,7 +99,7 @@ It is **disabled by default**.
 pip install onnxruntime tokenizers numpy
 ```
 
-The model defaults to `~/.opencode-mem/data/.cache/Xenova/nomic-embed-text-v1` (override with `KB_EMBED_MODEL_DIR` or `EMBED_MODEL_DIR`). Use `PYTHON` env var to point at a specific interpreter if `python3` lacks the deps.
+The model defaults to `~/.opencode-md-memory/models/nomic-embed-text-v1` — download `Xenova/nomic-embed-text-v1` from Hugging Face and extract it there. Override the location with `MDM_EMBED_MODEL_DIR` (or `EMBED_MODEL_DIR`) if your model lives elsewhere. Use `PYTHON` to point at a specific interpreter if `python3` lacks the deps.
 
 If the embed server (python) or the API (remote) are unavailable, the injector logs a warning and skips instead of failing the session.
 

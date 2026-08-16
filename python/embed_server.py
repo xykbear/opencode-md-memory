@@ -11,8 +11,8 @@ Usage:
     python embed_server.py [--port PORT] [--model-dir DIR] [--idle-timeout SECONDS]
 
 Env:
-    KB_EMBED_MODEL_DIR / EMBED_MODEL_DIR  model directory override (default:
-        ~/.opencode-mem/data/.cache/Xenova/nomic-embed-text-v1)
+    MDM_EMBED_MODEL_DIR / EMBED_MODEL_DIR  model directory override (default:
+        ~/.opencode-md-memory/models/nomic-embed-text-v1/onnx)
     EMBED_SERVER_PORT                      default port (48611)
     EMBED_SERVER_IDLE_TIMEOUT              default idle timeout in seconds (1800)
 
@@ -30,12 +30,12 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-DEFAULT_MODEL_DIR = Path.home() / ".opencode-mem/data/.cache/Xenova/nomic-embed-text-v1/onnx"
+DEFAULT_MODEL_DIR = Path.home() / ".opencode-md-memory/models/nomic-embed-text-v1/onnx"
 DEFAULT_PORT = 48611
 
 
 def resolve_model_dir() -> Path | None:
-    for env_name in ("KB_EMBED_MODEL_DIR", "EMBED_MODEL_DIR"):
+    for env_name in ("MDM_EMBED_MODEL_DIR", "EMBED_MODEL_DIR"):
         v = os.environ.get(env_name)
         if v and Path(v).is_dir():
             return Path(v)
@@ -157,7 +157,7 @@ def main():
 
     model_dir = Path(args.model_dir) if args.model_dir else resolve_model_dir()
     if model_dir is None:
-        print("ERROR: embedding model not found. Set KB_EMBED_MODEL_DIR or EMBED_MODEL_DIR.", file=sys.stderr)
+        print("ERROR: embedding model not found. Set MDM_EMBED_MODEL_DIR or EMBED_MODEL_DIR.", file=sys.stderr)
         sys.exit(1)
 
     Handler.embedder = build_embedder(model_dir)

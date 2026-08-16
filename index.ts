@@ -368,9 +368,8 @@ async function ensurePythonServer(): Promise<string | null> {
   } catch {
     /* not running */
   }
-  const modelDirEnv = process.env.KB_EMBED_MODEL_DIR || process.env.EMBED_MODEL_DIR
   pythonServer = spawn(PYTHON, [PYTHON_SCRIPT, "--port", String(EMBED_SERVER_PORT)], {
-    env: { ...process.env, ...(modelDirEnv ? { KB_EMBED_MODEL_DIR: modelDirEnv } : {}) },
+    env: { ...process.env },
     stdio: ["ignore", "ignore", "pipe"],
   })
   pythonServer.unref?.() // 插件退出不阻塞；服务靠 idle-timeout 自回收
