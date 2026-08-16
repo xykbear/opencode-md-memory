@@ -13,7 +13,7 @@ const execFileAsync = promisify(execFile)
  * - Storage root: <current project directory>/.memory/ by default, or a fixed path via `storageRoot`
  * - ID-based: short ids (mdm_<n>) embedded at the start of filenames, parsed from filenames — no index mapping
  * - scope: omitted → root; all-modules → root + all modules (list/search only); <module> → that module's directory
- * - Gate: md_update / md_delete require a prior md_read of the file, otherwise rejected
+ * - Read set: md_update / md_delete require the id to have been loaded via md_read, preventing changes to unseen content
  * - search: rg first, falls back to JS string matching
  */
 
@@ -294,7 +294,7 @@ export const server: Plugin = async (_input, options: MdMemoryOptions = {}) => {
       }),
 
       md_read: tool({
-        description: "Read a memory by id, and mark it as read.",
+        description: "Read a memory by id.",
         args: {
           id: tool.schema.string().describe("Memory id, e.g. mdm_3"),
         },
@@ -316,7 +316,7 @@ export const server: Plugin = async (_input, options: MdMemoryOptions = {}) => {
       }),
 
       md_update: tool({
-        description: "Update an existing memory by id. Requires a prior md_read of that id.",
+        description: "Overwrite a memory by id with new content.",
         args: {
           id: tool.schema.string().describe("Memory id, e.g. mdm_3"),
           content: tool.schema.string().describe("New Markdown body"),
@@ -324,7 +324,7 @@ export const server: Plugin = async (_input, options: MdMemoryOptions = {}) => {
         async execute(args, context) {
           try {
             if (!readSet.has(args.id)) {
-              return `[gate denied] id=${args.id} was not read. Call md_read first, then update.`
+              return `[gate] id=${args.id} is not in the read set. Use md_read first to load it, then update.`
             }
             const abs = await locateById(context.directory, config, args.id)
             if (!abs) return `[error] id=${args.id} not found`
@@ -337,14 +337,14 @@ export const server: Plugin = async (_input, options: MdMemoryOptions = {}) => {
       }),
 
       md_delete: tool({
-        description: "Delete a memory by id. Requires a prior md_read of that id.",
+        description: "Delete a memory by id.",
         args: {
           id: tool.schema.string().describe("Memory id, e.g. mdm_3"),
         },
         async execute(args, context) {
           try {
             if (!readSet.has(args.id)) {
-              return `[gate denied] id=${args.id} was not read. Call md_read first, then delete.`
+              return `[gate] id=${args.id} is not in the read set. Use md_read first to load it, then delete.`
             }
             const abs = await locateById(context.directory, config, args.id)
             if (!abs) return `[error] id=${args.id} not found`

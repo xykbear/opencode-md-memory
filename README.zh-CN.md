@@ -11,7 +11,7 @@
 - **按 ID 精确读取** — 直接按 id 读取记忆，无模糊匹配
 - **全文搜索** — 基于 `rg`（失败回退 JS 匹配），支持跨 scope
 - **模块隔离** — 按模块子目录组织记忆
-- **写入门禁** — update/delete 前必须先 read，避免盲目修改
+- **已读集合** — update/delete 需先 read，避免修改从未看过的内容
 - **永久保留** — 不会自动清理；用 git 管理你的 `.memory/`
 - **零依赖** — 无 embedding 模型、无网络、无后台服务
 
@@ -58,7 +58,7 @@
 | `storageName` | string | `.memory`   | 项目根目录下的存储目录名。设置了 `storageRoot` 时忽略。                                  |
 | `storageRoot` | string | —           | 固定的存储绝对路径，例如 `"~/.opencode-memory"`。设置后记忆直接存于此路径，与项目目录无关，适合跨项目共享同一份记忆。 |
 | `idPrefix`    | string | `mdm_`      | 记忆文件 id 前缀，例如 `"mem_"` → `mem_1`。                                              |
-| `maxReadSet`  | number | `200`       | 门禁记住的「已读」id 上限；超出后最早的已读记录会被清除。                          |
+| `maxReadSet`  | number | `200`       | 已读集合记住的 id 上限；超出后最早的已读记录会被清除。                          |
 
 > `storageRoot` 支持 `~`（展开为用户主目录）。设置后记忆直接存储在指定位置，与项目目录无关，而非 `<项目>/.memory/`。
 
@@ -67,9 +67,9 @@
 | 工具       | 描述                                                               |
 |------------|--------------------------------------------------------------------|
 | `md_create` | 新建一条 Markdown 记忆，返回 id。                                 |
-| `md_read`   | 按 id 读取记忆，并标记为已读（update/delete 的前置条件）。         |
-| `md_update` | 按 id 更新已有记忆。需先 `md_read` 该 id。                        |
-| `md_delete` | 按 id 删除记忆。需先 `md_read` 该 id。                            |
+| `md_read`   | 按 id 读取记忆，并载入已读集合。                                  |
+| `md_update` | 用新内容覆盖指定 id 的记忆。需该 id 在已读集合中。                |
+| `md_delete` | 删除指定 id 的记忆。需该 id 在已读集合中。                        |
 | `md_list`   | 列出记忆文件。                                                     |
 | `md_search` | 全文搜索记忆内容。                                                 |
 
@@ -77,7 +77,7 @@
 
 - **id 化**：简短 id（`mdm_<n>`）内嵌文件名开头，从文件名解析，无需索引映射
 - **scope**：省略→根目录；`all-modules`→根+所有模块；`<module>`→该模块一级目录
-- **门禁**：`md_update` / `md_delete` 未先 `md_read` 则拒绝执行
+- **已读集合**：`md_update` / `md_delete` 需该 id 已通过 `md_read` 载入，防止修改或删除从未看过的内容
 - **搜索**：`rg` 优先，失败回退 JS 字符串匹配
 - **存储**：`<项目>/.memory/`，atomic 计数器
 
@@ -102,10 +102,10 @@ md_create({ name: "energy-density", content: "# Energy density\n..." })
 md_create({ name: "low-temp", content: "...", scope: "cell-trace" })
 → created mdm_2
 
-# 读取（门禁前提）
+# 读取（载入已读集合）
 md_read({ id: "mdm_1" })
 
-# 更新（需先 read）
+# 更新（id 需在已读集合中）
 md_update({ id: "mdm_1", content: "new content" })
 
 # 搜索（跨模块）

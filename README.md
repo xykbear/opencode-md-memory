@@ -11,7 +11,7 @@ No vector database, no embeddings, no auto-cleanup — memories are just `.md` f
 - **Exact read by id** — read a memory directly by its id, no fuzzy matching
 - **Full-text search** — `rg`-powered (falls back to JS matching), across scopes
 - **Module scoping** — organize memories into per-module subdirectories
-- **Write gate** — update/delete require a prior read of the file, preventing blind mutations
+- **Read set** — update/delete require the id to be read first, preventing changes to content never seen
 - **Permanent by design** — nothing is auto-deleted; version your `.memory/` with git
 - **Zero dependencies** — no embedding model, no network, no background service
 
@@ -58,7 +58,7 @@ All options are optional; defaults are shown.
 | `storageName` | string | `.memory`  | Directory name under the project root. Ignored when `storageRoot` is set.   |
 | `storageRoot` | string | —          | Fixed absolute path for storage, e.g. `"~/.opencode-memory"`. When set, memories are stored there directly, independent of the project directory. Useful to share one memory store across projects. |
 | `idPrefix`    | string | `mdm_`     | Prefix for memory file ids, e.g. `"mem_"` → `mem_1`.                         |
-| `maxReadSet`  | number | `200`      | Max "read" ids the write gate remembers; older read records are evicted beyond this. |
+| `maxReadSet`  | number | `200`      | Max ids the read set remembers; older read records are evicted beyond this. |
 
 > `storageRoot` accepts `~` (expanded to the home directory). When set, memories are stored there directly instead of under `<project>/.memory/`.
 
@@ -66,18 +66,18 @@ All options are optional; defaults are shown.
 
 | Tool       | Description                                                                 |
 |------------|-----------------------------------------------------------------------------|
-| `md_create` | Create a new Markdown memory; returns its id.                              |
-| `md_read`   | Read a memory by id; marks it as read (required before update/delete).     |
-| `md_update` | Update a memory by id. Requires a prior `md_read` of that id.              |
-| `md_delete` | Delete a memory by id. Requires a prior `md_read` of that id.              |
-| `md_list`   | List memory files.                                                          |
-| `md_search` | Full-text search across memory content.                                     |
+| `md_create` | Create a new Markdown memory; returns its id.                               |
+| `md_read`   | Read a memory by id; loads it into the read set.                              |
+| `md_update` | Overwrite a memory by id with new content. Requires the id to be in the read set. |
+| `md_delete` | Delete a memory by id. Requires the id to be in the read set.                 |
+| `md_list`   | List memory files.                                                           |
+| `md_search` | Full-text search across memory content.                                      |
 
 ## Core design
 
 - **Id-based**: short id (`mdm_<n>`) embedded at the start of the filename, parsed from the filename — no index mapping needed.
 - **Scope**: omitted → root; `all-modules` → root + all modules; `<module>` → that module's first-level directory.
-- **Gate**: `md_update` / `md_delete` refuse to run unless the id was read first via `md_read`.
+- **Read set**: `md_update` / `md_delete` require the id to have been loaded via `md_read` first; this guards against modifying or removing content the agent never saw.
 - **Search**: `rg` first, falls back to JS string matching.
 - **Storage**: `<project>/.memory/` with an atomic counter.
 
@@ -102,10 +102,10 @@ md_create({ name: "energy-density", content: "# Energy density\n..." })
 md_create({ name: "low-temp", content: "...", scope: "cell-trace" })
 → created mdm_2
 
-# Read (gate precondition)
+# Read (loads into the read set)
 md_read({ id: "mdm_1" })
 
-# Update (requires prior read)
+# Update (id must be in the read set)
 md_update({ id: "mdm_1", content: "new content" })
 
 # Search across modules
