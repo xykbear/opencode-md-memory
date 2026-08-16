@@ -49,7 +49,11 @@
         "idPrefix": "mdm_",
         "maxReadSet": 200,
         "injectorEnabled": false,
+        "embeddingBackend": "local",
         "semanticModel": "Xenova/all-MiniLM-L6-v2",
+        "remoteApiUrl": "https://api.openai.com/v1",
+        "remoteApiKey": "{env:OPENAI_API_KEY}",
+        "remoteModel": "text-embedding-3-small",
         "injectorTopK": 3,
         "injectorMinLen": 10,
         "injectorMaxPerSession": 5
@@ -59,17 +63,21 @@
 }
 ```
 
-| 配置项                | 类型   | 默认值                        | 说明                                                                                             |
-|-----------------------|--------|-------------------------------|--------------------------------------------------------------------------------------------------|
-| `storageName`         | string | `.memory`                     | 项目根目录下的存储目录名。设置了 `storageRoot` 时忽略。                                          |
-| `storageRoot`         | string | —                             | 固定的存储绝对路径，例如 `"~/.opencode-memory"`。设置后记忆直接存于此路径，与项目目录无关，适合跨项目共享同一份记忆。 |
-| `idPrefix`            | string | `mdm_`                        | 记忆文件 id 前缀，例如 `"mem_"` → `mem_1`。                                                      |
-| `maxReadSet`          | number | `200`                         | 已读集合记住的 id 上限；超出后最早的已读记录会被清除。                                            |
-| `injectorEnabled`     | boolean| `false`                       | 通过 `chat.message` hook 将记忆参考注入聊天。需要安装可选嵌入依赖。                              |
-| `semanticModel`       | string | `Xenova/all-MiniLM-L6-v2`     | 注入器使用的嵌入模型 id。                                                                        |
-| `injectorTopK`        | number | `3`                           | 每次触发注入的最大参考条目数。                                                                   |
-| `injectorMinLen`      | number | `10`                          | 触发注入的最小消息长度（字符）；更短的消息跳过。                                                 |
-| `injectorMaxPerSession` | number | `5`                         | 每个会话的最大注入次数，防止上下文膨胀。                                                          |
+| 配置项                  | 类型   | 默认值                        | 说明                                                                                             |
+|-------------------------|--------|-------------------------------|--------------------------------------------------------------------------------------------------|
+| `storageName`           | string | `.memory`                     | 项目根目录下的存储目录名。设置了 `storageRoot` 时忽略。                                          |
+| `storageRoot`           | string | —                             | 固定的存储绝对路径，例如 `"~/.opencode-memory"`。设置后记忆直接存于此路径，与项目目录无关，适合跨项目共享同一份记忆。 |
+| `idPrefix`              | string | `mdm_`                        | 记忆文件 id 前缀，例如 `"mem_"` → `mem_1`。                                                      |
+| `maxReadSet`            | number | `200`                         | 已读集合记住的 id 上限；超出后最早的已读记录会被清除。                                            |
+| `injectorEnabled`       | boolean| `false`                       | 通过 `chat.message` hook 将记忆参考注入聊天。需要嵌入（本地或远程）。                            |
+| `embeddingBackend`      | string | `local`                       | `"local"`（transformers.js）或 `"remote"`（OpenAI 兼容 embeddings API）。无法运行本地 ONNX 模型的机器用 remote。 |
+| `semanticModel`         | string | `Xenova/all-MiniLM-L6-v2`     | **本地**后端的嵌入模型 id。                                                                      |
+| `remoteApiUrl`          | string | —                             | 远程嵌入 API 的 Base URL，例如 `https://api.openai.com/v1`。                                     |
+| `remoteApiKey`          | string | —                             | 远程嵌入 API 密钥。支持 `{env:VAR}` 或 `$VAR` 从环境变量读取。                                    |
+| `remoteModel`           | string | `text-embedding-3-small`      | 远程嵌入 API 的模型 id。                                                                         |
+| `injectorTopK`          | number | `3`                           | 每次触发注入的最大参考条目数。                                                                   |
+| `injectorMinLen`        | number | `10`                          | 触发注入的最小消息长度（字符）；更短的消息跳过。                                                 |
+| `injectorMaxPerSession` | number | `5`                           | 每个会话的最大注入次数，防止上下文膨胀。                                                          |
 
 > `storageRoot` 支持 `~`（展开为用户主目录）。设置后记忆直接存储在指定位置，与项目目录无关，而非 `<项目>/.memory/`。
 
@@ -77,17 +85,23 @@
 
 当 `injectorEnabled: true` 时，插件挂载 `chat.message` hook。对每条符合条件的用户消息：
 
-1. 用 MiniLM 嵌入消息，并在持久化索引（每条记忆按 `id + title` 索引）上排序。
+1. 嵌入消息，并在持久化索引（每条记忆按 `id + title` 索引）上排序。
 2. 在消息前插入 `<memory_reference>` 块，列出 top-k 匹配条目（`id + title + 路径`），并明确标注这是**参考上下文，而非用户指令**。
 3. 由 Agent 决定是否用 `md_read` / `md_search` 跟进读取原文；语义匹配**只做触发，不做最终检索**。
 
-**默认关闭**。启用需在 opencode 配置目录安装可选依赖：
+**默认关闭**。
+
+**本地后端**（默认）：在 opencode 配置目录安装可选依赖：
 
 ```bash
 cd ~/.config/opencode && npm install @huggingface/transformers onnxruntime-node
 ```
 
-嵌入模型（默认 `Xenova/all-MiniLM-L6-v2`）首次使用时下载并本地缓存。若依赖或模型不可用，注入器记录警告并跳过，不中断会话。
+模型（默认 `Xenova/all-MiniLM-L6-v2`）首次使用时下载并本地缓存。
+
+**远程后端**：无法运行本地 ONNX 模型的机器（如 Windows）可设置 `embeddingBackend: "remote"` 并配置 `remoteApiUrl`、`remoteApiKey`、`remoteModel`。注入器调用 OpenAI 兼容的 `/embeddings` 端点，无需本地模型依赖。`remoteApiKey` 支持 `{env:VAR}` 或 `$VAR` 从环境变量读取，避免明文存于 `opencode.json`。
+
+若依赖（本地）或 API（远程）不可用，注入器记录警告并跳过，不中断会话。
 
 > **索引持久化**：仅将每条记忆的 `id + title`（从文件名解析）嵌入并存储到 `.memory/.index/index.json`。会话首次注入时，索引会与当前文件做增量同步——新文件嵌入追加、已删除文件移除、重命名文件重新嵌入。内容变更不会使索引失效，因此每次编辑都无需重嵌入。索引是缓存，通过自动写入的 `.memory/.gitignore` 排除在 git 之外。
 

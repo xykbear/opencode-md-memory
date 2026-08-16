@@ -49,7 +49,11 @@ All options are optional; defaults are shown.
         "idPrefix": "mdm_",
         "maxReadSet": 200,
         "injectorEnabled": false,
+        "embeddingBackend": "local",
         "semanticModel": "Xenova/all-MiniLM-L6-v2",
+        "remoteApiUrl": "https://api.openai.com/v1",
+        "remoteApiKey": "{env:OPENAI_API_KEY}",
+        "remoteModel": "text-embedding-3-small",
         "injectorTopK": 3,
         "injectorMinLen": 10,
         "injectorMaxPerSession": 5
@@ -65,8 +69,12 @@ All options are optional; defaults are shown.
 | `storageRoot`         | string | —                           | Fixed absolute path for storage, e.g. `"~/.opencode-memory"`. When set, memories are stored there directly, independent of the project directory. Useful to share one memory store across projects. |
 | `idPrefix`            | string | `mdm_`                      | Prefix for memory file ids, e.g. `"mem_"` → `mem_1`.                         |
 | `maxReadSet`          | number | `200`                       | Max ids the read set remembers; older read records are evicted beyond this. |
-| `injectorEnabled`     | boolean| `false`                     | Inject memory references into chat via the `chat.message` hook. Requires optional embedding deps. |
-| `semanticModel`       | string | `Xenova/all-MiniLM-L6-v2`   | Embedding model id used by the injector.                                     |
+| `injectorEnabled`     | boolean| `false`                     | Inject memory references into chat via the `chat.message` hook. Requires embedding (local or remote). |
+| `embeddingBackend`    | string | `local`                     | `"local"` (transformers.js) or `"remote"` (OpenAI-compatible embeddings API). Use remote on machines that can't run local ONNX models. |
+| `semanticModel`       | string | `Xenova/all-MiniLM-L6-v2`   | Model id for the **local** backend.                                          |
+| `remoteApiUrl`        | string | —                           | Base URL for the remote embeddings API, e.g. `https://api.openai.com/v1`.    |
+| `remoteApiKey`        | string | —                           | API key for remote embeddings. Supports `{env:VAR}` or `$VAR` to read from environment. |
+| `remoteModel`         | string | `text-embedding-3-small`    | Model id for the remote embeddings API.                                      |
 | `injectorTopK`        | number | `3`                         | Max references injected per triggering message.                              |
 | `injectorMinLen`      | number | `10`                        | Min message length (chars) that triggers injection; shorter messages are skipped. |
 | `injectorMaxPerSession` | number | `5`                       | Max injections per session, preventing context bloat.                        |
@@ -77,17 +85,23 @@ All options are optional; defaults are shown.
 
 When `injectorEnabled: true`, the plugin hooks `chat.message`. For each qualifying user message it:
 
-1. Embeds the message with MiniLM and ranks the persisted index (each memory indexed by `id + title`).
+1. Embeds the message and ranks the persisted index (each memory indexed by `id + title`).
 2. Prepends a `<memory_reference>` block listing the top-k matching entries (`id + title + path`) as *reference context* — explicitly **not** an instruction from the user.
 3. Lets the agent decide whether to follow up with `md_read` / `md_search`; semantic matching is **trigger only**, never a substitute for reading the actual content.
 
-It is **disabled by default**. To enable it, install the optional dependencies in your opencode config directory:
+It is **disabled by default**.
+
+**Local backend** (default): install the optional dependencies in your opencode config directory:
 
 ```bash
 cd ~/.config/opencode && npm install @huggingface/transformers onnxruntime-node
 ```
 
-The embedding model (default `Xenova/all-MiniLM-L6-v2`) is downloaded on first use and cached locally. If the deps or model are unavailable, the injector logs a warning and skips instead of failing the session.
+The model (default `Xenova/all-MiniLM-L6-v2`) is downloaded on first use and cached locally.
+
+**Remote backend**: on machines that can't run local ONNX models (e.g. Windows), set `embeddingBackend: "remote"` with `remoteApiUrl`, `remoteApiKey`, and `remoteModel`. The injector calls the OpenAI-compatible `/embeddings` endpoint and requires no local model dependencies. `remoteApiKey` accepts `{env:VAR}` or `$VAR` to read the key from the environment instead of storing it in `opencode.json`.
+
+If the deps (local) or the API (remote) are unavailable, the injector logs a warning and skips instead of failing the session.
 
 > **Index persistence**: only each memory's `id + title` (parsed from the filename) is embedded and stored in `.memory/.index/index.json`. On the first injection of a session the index is brought in sync with the current files incrementally — new files are embedded, deleted files are dropped, renamed files are re-embedded. Content changes never invalidate the index, so there is no re-embedding cost per edit. The index is a cache and is excluded from git via an auto-written `.memory/.gitignore`.
 

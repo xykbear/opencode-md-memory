@@ -31,8 +31,16 @@ interface MdMemoryOptions {
   maxReadSet?: number
   /** Inject matching memory references into chat via the chat.message hook (requires optional deps). Default false */
   injectorEnabled?: boolean
-  /** Embedding model id for the injector. Default cached all-MiniLM-L6-v2 */
+  /** Embedding backend: "local" (transformers.js, default) or "remote" (OpenAI-compatible API) */
+  embeddingBackend?: "local" | "remote"
+  /** Embedding model id for local backend. Default cached all-MiniLM-L6-v2 */
   semanticModel?: string
+  /** Base URL for remote embeddings API, e.g. https://api.openai.com/v1 */
+  remoteApiUrl?: string
+  /** API key for remote embeddings. Supports {env:VAR} to read from environment */
+  remoteApiKey?: string
+  /** Model id for remote embeddings, e.g. text-embedding-3-small */
+  remoteModel?: string
   /** Top-k references injected per message (default 3) */
   injectorTopK?: number
   /** Minimum message length (chars) to trigger injection (default 10) */
@@ -47,7 +55,11 @@ interface ResolvedConfig {
   idPrefix: string
   maxReadSet: number
   injectorEnabled: boolean
+  embeddingBackend: "local" | "remote"
   semanticModel: string
+  remoteApiUrl?: string
+  remoteApiKey?: string
+  remoteModel?: string
   injectorTopK: number
   injectorMinLen: number
   injectorMaxPerSession: number
@@ -92,7 +104,11 @@ function resolveConfig(options: MdMemoryOptions): ResolvedConfig {
     idPrefix: options.idPrefix ?? "mdm_",
     maxReadSet: options.maxReadSet ?? 200,
     injectorEnabled: options.injectorEnabled ?? false,
+    embeddingBackend: options.embeddingBackend ?? "local",
     semanticModel: options.semanticModel ?? "Xenova/all-MiniLM-L6-v2",
+    remoteApiUrl: options.remoteApiUrl?.replace(/\/+$/, ""),
+    remoteApiKey: options.remoteApiKey,
+    remoteModel: options.remoteModel,
     injectorTopK: options.injectorTopK ?? 3,
     injectorMinLen: options.injectorMinLen ?? 10,
     injectorMaxPerSession: options.injectorMaxPerSession ?? 5,
@@ -320,45 +336,107 @@ interface LoadResult {
 }
 interface LoadFailure {
   ok: false
-  reason: "deps" | "model"
+  reason: "deps" | "model" | "remote"
 }
 
-let embedderState: { modelId: string; promise: Promise<LoadResult | LoadFailure> } | null = null
+let embedderState: { key: string; promise: Promise<LoadResult | LoadFailure> } | null = null
 
-/** Lazily load the embedding pipeline. Distinguishes missing deps from model-load failures; failures are not cached so later calls retry. */
-function getEmbedder(modelId: string): Promise<LoadResult | LoadFailure> {
-  if (embedderState && embedderState.modelId === modelId) return embedderState.promise
-  const promise = (async (): Promise<LoadResult | LoadFailure> => {
-    try {
-      const { pipeline, env } = await import("@huggingface/transformers")
-      env.allowRemoteModels = true
-      const pipe = await pipeline("feature-extraction", modelId)
-      return {
-        ok: true,
-        embedder: {
-          async embed(text: string): Promise<number[]> {
-            const out = await pipe(text, { pooling: "mean", normalize: true })
-            return Array.from(out.data as Float32Array)
-          },
-          async embedMany(texts: string[]): Promise<number[][]> {
-            const out = await pipe(texts, { pooling: "mean", normalize: true })
-            const data = out.data as Float32Array
-            const dims = (out.dims as number[])[out.dims.length - 1]
-            const result: number[][] = []
-            for (let i = 0; i < texts.length; i++) {
-              result.push(Array.from(data.subarray(i * dims, (i + 1) * dims)))
-            }
-            return result
-          },
-        },
+/** Resolve an apiKey that may be "{env:VAR}" or a plain secret, falling back to env var of the same name. */
+function resolveSecret(value: string | undefined): string | undefined {
+  if (!value) return undefined
+  const m = value.match(/^\{env:([A-Za-z_][A-Za-z0-9_]*)\}$/)
+  if (m) return process.env[m[1]]
+  if (value.startsWith("$")) return process.env[value.slice(1)]
+  return value
+}
+
+/** Build the local transformers.js embedder. */
+async function buildLocalEmbedder(modelId: string): Promise<Embedder> {
+  const { pipeline, env } = await import("@huggingface/transformers")
+  env.allowRemoteModels = true
+  const pipe = await pipeline("feature-extraction", modelId)
+  return {
+    async embed(text: string): Promise<number[]> {
+      const out = await pipe(text, { pooling: "mean", normalize: true })
+      return Array.from(out.data as Float32Array)
+    },
+    async embedMany(texts: string[]): Promise<number[][]> {
+      const out = await pipe(texts, { pooling: "mean", normalize: true })
+      const data = out.data as Float32Array
+      const dims = (out.dims as number[])[out.dims.length - 1]
+      const result: number[][] = []
+      for (let i = 0; i < texts.length; i++) {
+        result.push(Array.from(data.subarray(i * dims, (i + 1) * dims)))
       }
+      return result
+    },
+  }
+}
+
+/** Build a remote OpenAI-compatible embeddings embedder. */
+function buildRemoteEmbedder(apiUrl: string, apiKey: string | undefined, model: string): Embedder {
+  const url = `${apiUrl}/embeddings`
+  const headers: Record<string, string> = { "Content-Type": "application/json" }
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`
+  const request = async (input: string | string[]): Promise<number[][]> => {
+    const res = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ model, input }),
+    })
+    if (!res.ok) {
+      throw new Error(`remote embeddings ${res.status}: ${(await res.text()).slice(0, 200)}`)
+    }
+    const data = (await res.json()) as { data: { embedding: number[] }[] }
+    return data.data.map((d) => d.embedding)
+  }
+  return {
+    async embed(text: string): Promise<number[]> {
+      const [v] = await request(text)
+      return v
+    },
+    async embedMany(texts: string[]): Promise<number[][]> {
+      return request(texts)
+    },
+  }
+}
+
+/**
+ * Lazily load the embedder for the configured backend. A failure is cached so repeated calls don't
+ * hammer a dead endpoint; the returned reason distinguishes missing local deps, local model load
+ * failure, and remote API failure.
+ */
+function getEmbedder(config: ResolvedConfig): Promise<LoadResult | LoadFailure> {
+  const key =
+    config.embeddingBackend === "remote"
+      ? `remote:${config.remoteApiUrl}:${config.remoteModel}`
+      : `local:${config.semanticModel}`
+  if (embedderState && embedderState.key === key) return embedderState.promise
+  const promise = (async (): Promise<LoadResult | LoadFailure> => {
+    if (config.embeddingBackend === "remote") {
+      if (!config.remoteApiUrl) return { ok: false, reason: "remote" }
+      try {
+        const embedder = buildRemoteEmbedder(
+          config.remoteApiUrl,
+          resolveSecret(config.remoteApiKey),
+          config.remoteModel ?? "text-embedding-3-small"
+        )
+        // Eager probe: surface auth/network/config errors now (as LoadFailure) instead of later
+        // inside syncIndex/query embedding, where they would leak through chat.message's catch.
+        await embedder.embed("ping")
+        return { ok: true, embedder }
+      } catch {
+        return { ok: false, reason: "remote" }
+      }
+    }
+    try {
+      return { ok: true, embedder: await buildLocalEmbedder(config.semanticModel) }
     } catch (e) {
-      // Missing import => deps not installed; any other throw (fetch, model parse) => model unavailable.
       const code = (e as { code?: string })?.code
       return { ok: false, reason: code === "ERR_MODULE_NOT_FOUND" ? "deps" : "model" }
     }
   })()
-  embedderState = { modelId, promise }
+  embedderState = { key, promise }
   return promise
 }
 
@@ -487,12 +565,16 @@ async function buildMemoryReference(
   topK: number,
   log: LogFn
 ): Promise<string | null> {
-  const loaded = await getEmbedder(config.semanticModel)
+  const loaded = await getEmbedder(config)
   if (!loaded.ok) {
     const reason =
       loaded.reason === "deps"
         ? "injector skipped: @huggingface/transformers not installed. Run: npm i @huggingface/transformers onnxruntime-node"
-        : `injector skipped: embedding model "${config.semanticModel}" could not be loaded. Check network or configure semanticModel.`
+        : loaded.reason === "remote"
+          ? config.remoteApiUrl
+            ? `injector skipped: remote embeddings API "${config.remoteApiUrl}" failed. Check remoteApiUrl/remoteApiKey/remoteModel.`
+            : `injector skipped: embeddingBackend is "remote" but remoteApiUrl is not set.`
+          : `injector skipped: embedding model "${config.semanticModel}" could not be loaded. Check network or configure semanticModel.`
     log("warn", reason.replace(/^injector skipped: /, ""), { reason: loaded.reason })
     return null
   }
