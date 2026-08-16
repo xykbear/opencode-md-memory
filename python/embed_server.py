@@ -8,12 +8,16 @@ onnxruntime native bindings reliably; plain Python is cross-platform (macOS,
 Windows, Linux) and stable.
 
 Usage:
-    python embed_server.py [--port PORT] [--model-dir DIR]
+    python embed_server.py [--port PORT] [--model-dir DIR] [--idle-timeout SECONDS]
 
 Env:
     KB_EMBED_MODEL_DIR / EMBED_MODEL_DIR  model directory override (default:
         ~/.opencode-mem/data/.cache/Xenova/nomic-embed-text-v1)
     EMBED_SERVER_PORT                      default port (48611)
+    EMBED_SERVER_IDLE_TIMEOUT              default idle timeout in seconds (1800)
+
+The server exits itself after --idle-timeout seconds without any request, so
+it does not linger after the plugins stop using it.
 """
 from __future__ import annotations
 
@@ -21,6 +25,8 @@ import argparse
 import json
 import os
 import sys
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -93,12 +99,19 @@ def build_embedder(model_dir: Path):
 
 class Handler(BaseHTTPRequestHandler):
     embedder = None  # set by server
+    idle_timeout = 1800  # seconds without any request before self-exit
+    _last_activity = None  # set by server
 
     def log_message(self, fmt, *args):
         if self.path == "/embed":
             print(f"[embed-request] {self.path}", flush=True)
 
+    def _touch(self):
+        if Handler._last_activity is not None:
+            Handler._last_activity[0] = time.monotonic()
+
     def do_POST(self):
+        self._touch()
         if self.path != "/embed":
             self.send_error(404)
             return
@@ -119,6 +132,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {"error": str(e)})
 
     def do_GET(self):
+        self._touch()
         if self.path == "/health":
             self._json(200, {"ok": True, "dim": None})
         else:
@@ -137,6 +151,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=int(os.environ.get("EMBED_SERVER_PORT", DEFAULT_PORT)))
     parser.add_argument("--model-dir", type=str, default=None)
+    parser.add_argument("--idle-timeout", type=int,
+                        default=int(os.environ.get("EMBED_SERVER_IDLE_TIMEOUT", "1800")))
     args = parser.parse_args()
 
     model_dir = Path(args.model_dir) if args.model_dir else resolve_model_dir()
@@ -145,8 +161,25 @@ def main():
         sys.exit(1)
 
     Handler.embedder = build_embedder(model_dir)
+    Handler.idle_timeout = args.idle_timeout
+    Handler._last_activity = [time.monotonic()]
+
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    print(f"embedding server listening on 127.0.0.1:{args.port} (model: {model_dir})", flush=True)
+    print(f"embedding server listening on 127.0.0.1:{args.port} "
+          f"(model: {model_dir}, idle-timeout: {args.idle_timeout}s)", flush=True)
+
+    def idle_watchdog():
+        while True:
+            time.sleep(5)
+            if Handler._last_activity is None:
+                return
+            idle = time.monotonic() - Handler._last_activity[0]
+            if idle >= Handler.idle_timeout:
+                print(f"embedding server idle for {idle:.0f}s, shutting down", flush=True)
+                threading.Thread(target=server.shutdown, daemon=True).start()
+                return
+
+    threading.Thread(target=idle_watchdog, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

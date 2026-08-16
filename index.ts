@@ -17,7 +17,8 @@ const execFileAsync = promisify(execFile)
  * - Read set: md_update / md_delete require the id to have been loaded via md_read, preventing changes to unseen content
  * - search: rg first, falls back to JS string matching
  * - Semantic injector (optional): embeds id+title of each memory into `.memory/.index/`, and on every user
- *   message matches it against the index via MiniLM, injecting a <memory_reference> block as context
+ *   message matches it against the index via an embedding backend (python or remote), injecting a
+ *   <memory_reference> block as context
  */
 
 /** Plugin options — set via ["opencode-md-memory", { ... }] in opencode.json */
@@ -323,7 +324,7 @@ async function runSearch(root: string, config: ResolvedConfig, scope: string | u
   return out
 }
 
-// --- Semantic search (optional, requires @huggingface/transformers + onnxruntime-node) ---
+// --- Embedding backends (python local server or remote OpenAI-compatible API) ---
 
 interface Embedder {
   embed(text: string): Promise<number[]>
@@ -367,11 +368,18 @@ async function ensurePythonServer(): Promise<string | null> {
   } catch {
     /* not running */
   }
+  const modelDirEnv = process.env.KB_EMBED_MODEL_DIR || process.env.EMBED_MODEL_DIR
   pythonServer = spawn(PYTHON, [PYTHON_SCRIPT, "--port", String(EMBED_SERVER_PORT)], {
+    env: { ...process.env, ...(modelDirEnv ? { KB_EMBED_MODEL_DIR: modelDirEnv } : {}) },
     stdio: ["ignore", "ignore", "pipe"],
   })
+  pythonServer.unref?.() // 插件退出不阻塞；服务靠 idle-timeout 自回收
   pythonServer.stderr?.on("data", (d) => {
     console.error(`[opencode-md-memory] embed server stderr: ${String(d).trim().slice(0, 200)}`)
+  })
+  pythonServer.on("error", (e) => {
+    // 端口被占（另一插件已起服务）等：忽略，靠 health 探测复用
+    console.error(`[opencode-md-memory] embed server spawn error: ${e.message}`)
   })
   for (let i = 0; i < 50; i++) {
     await new Promise((r) => setTimeout(r, 200))
