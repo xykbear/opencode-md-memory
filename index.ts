@@ -35,14 +35,12 @@ interface MdMemoryOptions {
   injectorEnabled?: boolean
   /** Embedding backend: "remote" (OpenAI-compatible API) or "python" (local Python embed server). Default "remote" */
   embeddingBackend?: "remote" | "python"
-  /** Embedding model id for remote backend, e.g. text-embedding-3-small */
-  semanticModel?: string
   /** Base URL for remote embeddings API, e.g. https://api.openai.com/v1 */
   remoteApiUrl?: string
   /** API key for remote embeddings. Supports {env:VAR} to read from environment */
   remoteApiKey?: string
-  /** Model id for remote embeddings, e.g. text-embedding-3-small */
-  remoteModel?: string
+  /** Embedding model id, used for both remote API and local python model path resolution (default "nomic-embed-text-v1") */
+  embeddingModel?: string
   /** Top-k references injected per message (default 3) */
   injectorTopK?: number
   /** Minimum message length (chars) to trigger injection (default 10) */
@@ -58,10 +56,9 @@ interface ResolvedConfig {
   maxReadSet: number
   injectorEnabled: boolean
   embeddingBackend: "remote" | "python"
-  semanticModel: string
   remoteApiUrl?: string
   remoteApiKey?: string
-  remoteModel?: string
+  embeddingModel: string
   injectorTopK: number
   injectorMinLen: number
   injectorMaxPerSession: number
@@ -107,10 +104,9 @@ function resolveConfig(options: MdMemoryOptions): ResolvedConfig {
     maxReadSet: options.maxReadSet ?? 200,
     injectorEnabled: options.injectorEnabled ?? false,
     embeddingBackend: options.embeddingBackend ?? "remote",
-    semanticModel: options.semanticModel ?? "text-embedding-3-small",
     remoteApiUrl: options.remoteApiUrl?.replace(/\/+$/, ""),
     remoteApiKey: options.remoteApiKey,
-    remoteModel: options.remoteModel,
+    embeddingModel: options.embeddingModel ?? "nomic-embed-text-v1",
     injectorTopK: options.injectorTopK ?? 3,
     injectorMinLen: options.injectorMinLen ?? 10,
     injectorMaxPerSession: options.injectorMaxPerSession ?? 5,
@@ -360,7 +356,7 @@ const PYTHON_SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), "p
 let pythonServer: ReturnType<typeof spawn> | null = null
 
 /** Ensure the Python embed server is running; returns its base URL or null. */
-async function ensurePythonServer(): Promise<string | null> {
+async function ensurePythonServer(modelName: string): Promise<string | null> {
   const url = `http://127.0.0.1:${EMBED_SERVER_PORT}`
   try {
     const res = await fetch(`${url}/health`)
@@ -368,7 +364,7 @@ async function ensurePythonServer(): Promise<string | null> {
   } catch {
     /* not running */
   }
-  pythonServer = spawn(PYTHON, [PYTHON_SCRIPT, "--port", String(EMBED_SERVER_PORT)], {
+  pythonServer = spawn(PYTHON, [PYTHON_SCRIPT, "--port", String(EMBED_SERVER_PORT), "--model-name", modelName], {
     env: { ...process.env },
     stdio: ["ignore", "ignore", "pipe"],
   })
@@ -453,7 +449,7 @@ function buildRemoteEmbedder(apiUrl: string, apiKey: string | undefined, model: 
 function getEmbedder(config: ResolvedConfig): Promise<LoadResult | LoadFailure> {
   const key =
     config.embeddingBackend === "remote"
-      ? `remote:${config.remoteApiUrl}:${config.remoteModel}`
+      ? `remote:${config.remoteApiUrl}:${config.embeddingModel}`
       : `python:${EMBED_SERVER_PORT}`
   if (embedderState && embedderState.key === key) return embedderState.promise
   const promise = (async (): Promise<LoadResult | LoadFailure> => {
@@ -463,7 +459,7 @@ function getEmbedder(config: ResolvedConfig): Promise<LoadResult | LoadFailure> 
         const embedder = buildRemoteEmbedder(
           config.remoteApiUrl,
           resolveSecret(config.remoteApiKey),
-          config.remoteModel ?? "text-embedding-3-small"
+          config.embeddingModel
         )
         // Eager probe: surface auth/network/config errors now (as LoadFailure) instead of later
         // inside syncIndex/query embedding, where they would leak through chat.message's catch.
@@ -474,7 +470,7 @@ function getEmbedder(config: ResolvedConfig): Promise<LoadResult | LoadFailure> 
       }
     }
     try {
-      const base = await ensurePythonServer()
+      const base = await ensurePythonServer(config.embeddingModel)
       if (!base) return { ok: false, reason: "model" }
       return { ok: true, embedder: buildPythonEmbedder(base) }
     } catch (e) {
@@ -618,7 +614,7 @@ async function buildMemoryReference(
         ? "injector skipped: python embedding server unavailable. Ensure python3 with onnxruntime+tokenizers is installed (see python/embed_server.py)."
         : loaded.reason === "remote"
           ? config.remoteApiUrl
-            ? `injector skipped: remote embeddings API "${config.remoteApiUrl}" failed. Check remoteApiUrl/remoteApiKey/remoteModel.`
+            ? `injector skipped: remote embeddings API "${config.remoteApiUrl}" failed. Check remoteApiUrl/remoteApiKey/embeddingModel.`
             : `injector skipped: embeddingBackend is "remote" but remoteApiUrl is not set.`
           : "injector skipped: local embedding model could not be loaded. Ensure python3 with onnxruntime+tokenizers (see python/embed_server.py)."
     log("warn", reason.replace(/^injector skipped: /, ""), { reason: loaded.reason })

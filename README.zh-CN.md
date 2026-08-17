@@ -18,21 +18,29 @@
 
 ## 安装
 
+### 从 npm 安装（推荐）
+
+在 `~/.config/opencode/opencode.json` 中添加：
+
+```json
+{
+  "plugin": ["opencode-md-memory"]
+}
+```
+
+然后重启 opencode。opencode 会自动从 npm 解析包。
+
 ### 本地文件
 
 将 `index.ts` 复制到 `~/.config/opencode/plugins/`（全局）或 `.opencode/plugins/`（项目）后重启 opencode，插件自动加载。
 
 ### 通过 GitHub
 
-在 `~/.config/opencode/opencode.json` 中添加：
-
 ```json
 {
   "plugin": ["opencode-md-memory@git+https://github.com/xykbear/opencode-md-memory.git"]
 }
 ```
-
-然后重启 opencode。
 
 ## 配置项
 
@@ -50,10 +58,9 @@
         "maxReadSet": 200,
         "injectorEnabled": false,
         "embeddingBackend": "remote",
-        "semanticModel": "text-embedding-3-small",
         "remoteApiUrl": "https://api.openai.com/v1",
         "remoteApiKey": "{env:OPENAI_API_KEY}",
-        "remoteModel": "text-embedding-3-small",
+        "embeddingModel": "nomic-embed-text-v1",
         "injectorTopK": 3,
         "injectorMinLen": 10,
         "injectorMaxPerSession": 5
@@ -71,10 +78,9 @@
 | `maxReadSet`            | number | `200`                         | 已读集合记住的 id 上限；超出后最早的已读记录会被清除。                                            |
 | `injectorEnabled`       | boolean| `false`                       | 通过 `chat.message` hook 将记忆参考注入聊天。需要嵌入（本地或远程）。                            |
 | `embeddingBackend`      | string | `remote`                      | `"remote"`（OpenAI 兼容 API）或 `"python"`（本地 Python 嵌入服务）。本地/离线嵌入用 python。 |
-| `semanticModel`         | string | `text-embedding-3-small`      | 远程后端的嵌入模型 id。                                                                         |
 | `remoteApiUrl`          | string | —                             | 远程嵌入 API 的 Base URL，例如 `https://api.openai.com/v1`。                                     |
 | `remoteApiKey`          | string | —                             | 远程嵌入 API 密钥。支持 `{env:VAR}` 或 `$VAR` 从环境变量读取。                                    |
-| `remoteModel`           | string | `text-embedding-3-small`      | 远程嵌入 API 的模型 id。                                                                         |
+| `embeddingModel`        | string | `nomic-embed-text-v1`         | 嵌入模型 id。远程后端传给 API；python 后端解析为 `~/.opencode-md-memory/models/{model}/onnx/`。 |
 | `injectorTopK`          | number | `3`                           | 每次触发注入的最大参考条目数。                                                                   |
 | `injectorMinLen`        | number | `10`                          | 触发注入的最小消息长度（字符）；更短的消息跳过。                                                 |
 | `injectorMaxPerSession` | number | `5`                           | 每个会话的最大注入次数，防止上下文膨胀。                                                          |
@@ -91,7 +97,7 @@
 
 **默认关闭**。
 
-**远程后端**（默认）：设置 `embeddingBackend: "remote"` 并配置 `remoteApiUrl`、`remoteApiKey`、`remoteModel`。注入器调用 OpenAI 兼容的 `/embeddings` 端点。`remoteApiKey` 支持 `{env:VAR}` 或 `$VAR` 从环境变量读取，避免明文存于 `opencode.json`。
+**远程后端**（默认）：设置 `embeddingBackend: "remote"` 并配置 `remoteApiUrl`、`remoteApiKey`、`embeddingModel`。注入器调用 OpenAI 兼容的 `/embeddings` 端点。`remoteApiKey` 支持 `{env:VAR}` 或 `$VAR` 从环境变量读取，避免明文存于 `opencode.json`。
 
 **Python 后端**：需要本地/离线嵌入时设置 `embeddingBackend: "python"`。插件会启动随包分发的 `python/embed_server.py`，通过 onnxruntime + tokenizers 加载本地 ONNX 模型，提供本地 HTTP `/embed` 接口。需要：
 

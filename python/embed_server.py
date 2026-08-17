@@ -30,16 +30,18 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+DEFAULT_MODEL_NAME = "nomic-embed-text-v1"
 DEFAULT_MODEL_DIR = Path.home() / ".opencode-md-memory/models/nomic-embed-text-v1/onnx"
 DEFAULT_PORT = 48611
 
 
-def resolve_model_dir() -> Path | None:
+def resolve_model_dir(model_name: str | None = None) -> Path | None:
     for env_name in ("MDM_EMBED_MODEL_DIR", "EMBED_MODEL_DIR"):
         v = os.environ.get(env_name)
         if v and Path(v).is_dir():
             return Path(v)
-    d = DEFAULT_MODEL_DIR
+    name = model_name or DEFAULT_MODEL_NAME
+    d = Path.home() / ".opencode-md-memory/models" / name / "onnx"
     return d if d.is_dir() else None
 
 
@@ -151,13 +153,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=int(os.environ.get("EMBED_SERVER_PORT", DEFAULT_PORT)))
     parser.add_argument("--model-dir", type=str, default=None)
+    parser.add_argument("--model-name", type=str, default=None)
     parser.add_argument("--idle-timeout", type=int,
                         default=int(os.environ.get("EMBED_SERVER_IDLE_TIMEOUT", "1800")))
     args = parser.parse_args()
 
-    model_dir = Path(args.model_dir) if args.model_dir else resolve_model_dir()
+    model_dir = Path(args.model_dir) if args.model_dir else resolve_model_dir(args.model_name)
     if model_dir is None:
-        print("ERROR: embedding model not found. Set MDM_EMBED_MODEL_DIR or EMBED_MODEL_DIR.", file=sys.stderr)
+        print(f"ERROR: embedding model not found (model={args.model_name or DEFAULT_MODEL_NAME}). Set MDM_EMBED_MODEL_DIR or EMBED_MODEL_DIR.", file=sys.stderr)
         sys.exit(1)
 
     Handler.embedder = build_embedder(model_dir)

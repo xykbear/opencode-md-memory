@@ -18,21 +18,29 @@ No vector database, no auto-cleanup — memories are just `.md` files you can re
 
 ## Installation
 
+### From npm (recommended)
+
+Add to `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "plugin": ["opencode-md-memory"]
+}
+```
+
+Then restart opencode. opencode resolves the package from npm automatically.
+
 ### Local file
 
 Copy `index.ts` into `~/.config/opencode/plugins/` (global) or `.opencode/plugins/` (project) and restart opencode. The plugin is auto-loaded.
 
 ### From GitHub
 
-Add to `~/.config/opencode/opencode.json`:
-
 ```json
 {
   "plugin": ["opencode-md-memory@git+https://github.com/xykbear/opencode-md-memory.git"]
 }
 ```
-
-Then restart opencode.
 
 ## Configuration
 
@@ -50,10 +58,9 @@ All options are optional; defaults are shown.
         "maxReadSet": 200,
         "injectorEnabled": false,
         "embeddingBackend": "remote",
-        "semanticModel": "text-embedding-3-small",
         "remoteApiUrl": "https://api.openai.com/v1",
         "remoteApiKey": "{env:OPENAI_API_KEY}",
-        "remoteModel": "text-embedding-3-small",
+        "embeddingModel": "nomic-embed-text-v1",
         "injectorTopK": 3,
         "injectorMinLen": 10,
         "injectorMaxPerSession": 5
@@ -71,10 +78,9 @@ All options are optional; defaults are shown.
 | `maxReadSet`          | number | `200`                       | Max ids the read set remembers; older read records are evicted beyond this. |
 | `injectorEnabled`     | boolean| `false`                     | Inject memory references into chat via the `chat.message` hook. Requires embedding (python or remote). |
 | `embeddingBackend`    | string | `remote`                     | `"remote"` (OpenAI-compatible API) or `"python"` (local Python embed server). Use python for offline/local embeddings. |
-| `semanticModel`       | string | `text-embedding-3-small`     | Model id for the remote backend.                                                                    |
 | `remoteApiUrl`        | string | —                           | Base URL for the remote embeddings API, e.g. `https://api.openai.com/v1`.    |
 | `remoteApiKey`        | string | —                           | API key for remote embeddings. Supports `{env:VAR}` or `$VAR` to read from environment. |
-| `remoteModel`         | string | `text-embedding-3-small`    | Model id for the remote embeddings API.                                      |
+| `embeddingModel`      | string | `nomic-embed-text-v1`       | Embedding model id. For remote backend, passed to the API. For python backend, resolves to `~/.opencode-md-memory/models/{model}/onnx/`. |
 | `injectorTopK`        | number | `3`                         | Max references injected per triggering message.                              |
 | `injectorMinLen`      | number | `10`                        | Min message length (chars) that triggers injection; shorter messages are skipped. |
 | `injectorMaxPerSession` | number | `5`                       | Max injections per session, preventing context bloat.                        |
@@ -91,7 +97,7 @@ When `injectorEnabled: true`, the plugin hooks `chat.message`. For each qualifyi
 
 It is **disabled by default**.
 
-**Remote backend** (default): set `embeddingBackend: "remote"` with `remoteApiUrl`, `remoteApiKey`, and `remoteModel`. The injector calls the OpenAI-compatible `/embeddings` endpoint. `remoteApiKey` accepts `{env:VAR}` or `$VAR` to read the key from the environment instead of storing it in `opencode.json`.
+**Remote backend** (default): set `embeddingBackend: "remote"` with `remoteApiUrl`, `remoteApiKey`, and `embeddingModel`. The injector calls the OpenAI-compatible `/embeddings` endpoint. `remoteApiKey` accepts `{env:VAR}` or `$VAR` to read the key from the environment instead of storing it in `opencode.json`.
 
 **Python backend**: for local/offline embeddings, set `embeddingBackend: "python"`. The plugin spawns `python/embed_server.py` (bundled with the package), which loads an ONNX embedding model via onnxruntime + tokenizers and serves a local HTTP `/embed` endpoint. Requires:
 
