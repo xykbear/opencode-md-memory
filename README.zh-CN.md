@@ -109,7 +109,7 @@ pip install onnxruntime tokenizers numpy
 
 若嵌入服务（python）或 API（remote）不可用，注入器记录警告并跳过，不中断会话。
 
-> **索引持久化**：仅将每条记忆的 `id + title`（从文件名解析）嵌入并存储到 `.memory/.index/index.json`。会话首次注入时，索引会与当前文件做增量同步——新文件嵌入追加、已删除文件移除、重命名文件重新嵌入。内容变更不会使索引失效，因此每次编辑都无需重嵌入。索引是缓存，通过自动写入的 `.memory/.gitignore` 排除在 git 之外。
+> **索引持久化**：仅将每条记忆的 `id + title`（从文件名解析）嵌入并存储为 `.memory/.index/index.json` 中的元数据，向量存于扁平二进制文件 `.memory/.index/vectors.bin`。会话首次注入时，索引会与当前文件做增量同步——新文件嵌入追加、已删除文件移除、重命名文件重新嵌入。内容变更不会使索引失效，因此每次编辑都无需重嵌入。索引是缓存，通过自动写入的 `.memory/.gitignore` 排除在 git 之外。
 
 ## 工具
 
@@ -136,7 +136,8 @@ pip install onnxruntime tokenizers numpy
 .memory/
 ├── .gitignore           # 自动写入：忽略 ".index/"
 ├── .index/              # 语义索引缓存（git 忽略）
-│   └── index.json       # { entries: [{ id, title, vec }] }
+│   └── index.json       # { dim, entries: [{ id, title }] }（仅 id+title）
+│   └── vectors.bin      # 扁平 float32 向量，每条记录一行
 ├── meta.json            # 计数器 { "next_id": N }
 ├── mdm_1-<slug>.md      # 根目录（省略 scope）
 └── cell-trace/

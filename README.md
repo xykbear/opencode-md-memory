@@ -109,7 +109,7 @@ The model defaults to `~/.opencode-md-memory/models/nomic-embed-text-v1` — dow
 
 If the embed server (python) or the API (remote) are unavailable, the injector logs a warning and skips instead of failing the session.
 
-> **Index persistence**: only each memory's `id + title` (parsed from the filename) is embedded and stored in `.memory/.index/index.json`. On the first injection of a session the index is brought in sync with the current files incrementally — new files are embedded, deleted files are dropped, renamed files are re-embedded. Content changes never invalidate the index, so there is no re-embedding cost per edit. The index is a cache and is excluded from git via an auto-written `.memory/.gitignore`.
+> **Index persistence**: only each memory's `id + title` (parsed from the filename) is embedded and stored as metadata in `.memory/.index/index.json`, with the vectors in a flat binary file `.memory/.index/vectors.bin`. On the first injection of a session the index is brought in sync with the current files incrementally — new files are embedded, deleted files are dropped, renamed files are re-embedded. Content changes never invalidate the index, so there is no re-embedding cost per edit. The index is a cache and is excluded from git via an auto-written `.memory/.gitignore`.
 
 ## Tools
 
@@ -136,7 +136,8 @@ If the embed server (python) or the API (remote) are unavailable, the injector l
 .memory/
 ├── .gitignore           # auto-written: ignores ".index/"
 ├── .index/              # semantic index cache (git-ignored)
-│   └── index.json       # { entries: [{ id, title, vec }] }
+│   └── index.json       # { dim, entries: [{ id, title }] } (id+title only)
+│   └── vectors.bin      # flat float32 vectors, one row per entry
 ├── meta.json            # counter { "next_id": N }
 ├── mdm_1-<slug>.md      # root scope (scope omitted)
 └── cell-trace/
