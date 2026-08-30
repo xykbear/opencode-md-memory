@@ -35,6 +35,15 @@ DEFAULT_MODEL_DIR = Path.home() / ".opencode-md-memory/models/nomic-embed-text-v
 DEFAULT_PORT = 48611
 
 
+def log(msg: str):
+    """stdout 日志。插件进程重启后旧服务成孤儿、stdout 管道断裂时 print 会抛
+    BrokenPipeError 导致 /embed 返回 500——这里吞掉，让日志失败不影响请求。"""
+    try:
+        print(msg, flush=True)
+    except (BrokenPipeError, OSError):
+        pass
+
+
 def resolve_model_dir(model_name: str | None = None) -> Path | None:
     for env_name in ("MDM_EMBED_MODEL_DIR", "EMBED_MODEL_DIR"):
         v = os.environ.get(env_name)
@@ -105,8 +114,7 @@ class Handler(BaseHTTPRequestHandler):
     _last_activity = None  # set by server
 
     def log_message(self, fmt, *args):
-        if self.path == "/embed":
-            print(f"[embed-request] {self.path}", flush=True)
+        pass
 
     def _touch(self):
         if Handler._last_activity is not None:
@@ -128,7 +136,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(503, {"error": "embedder not loaded"})
                 return
             # 用 type(self) 引用类属性，避免实例访问时被当作绑定方法（self 被当第一个参数传入）
+            t0 = time.monotonic()
             vectors = type(self).embedder(texts)
+            elapsed = (time.monotonic() - t0) * 1000
+            log(f"[embed] texts={len(texts)} elapsed={elapsed:.1f}ms")
             self._json(200, {"vectors": vectors, "dim": len(vectors[0]) if vectors else 0})
         except Exception as e:
             self._json(500, {"error": str(e)})
@@ -163,13 +174,15 @@ def main():
         print(f"ERROR: embedding model not found (model={args.model_name or DEFAULT_MODEL_NAME}). Set MDM_EMBED_MODEL_DIR or EMBED_MODEL_DIR.", file=sys.stderr)
         sys.exit(1)
 
+    t0 = time.monotonic()
     Handler.embedder = build_embedder(model_dir)
+    log(f"model loaded in {time.monotonic() - t0:.2f}s")
     Handler.idle_timeout = args.idle_timeout
     Handler._last_activity = [time.monotonic()]
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    print(f"embedding server listening on 127.0.0.1:{args.port} "
-          f"(model: {model_dir}, idle-timeout: {args.idle_timeout}s)", flush=True)
+    log(f"embedding server listening on 127.0.0.1:{args.port} "
+        f"(model: {model_dir}, idle-timeout: {args.idle_timeout}s)")
 
     def idle_watchdog():
         while True:
@@ -178,7 +191,7 @@ def main():
                 return
             idle = time.monotonic() - Handler._last_activity[0]
             if idle >= Handler.idle_timeout:
-                print(f"embedding server idle for {idle:.0f}s, shutting down", flush=True)
+                log(f"embedding server idle for {idle:.0f}s, shutting down")
                 threading.Thread(target=server.shutdown, daemon=True).start()
                 return
 

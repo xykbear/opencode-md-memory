@@ -109,7 +109,7 @@ The model defaults to `~/.opencode-md-memory/models/nomic-embed-text-v1` — dow
 
 If the embed server (python) or the API (remote) are unavailable, the injector logs a warning and skips instead of failing the session.
 
-> **Index persistence**: only each memory's `id + title` (parsed from the filename) is embedded and stored as metadata in `.memory/.index/index.json`, with the vectors in a flat binary file `.memory/.index/vectors.bin`. On the first injection of a session the index is brought in sync with the current files incrementally — new files are embedded, deleted files are dropped, renamed files are re-embedded. Content changes never invalidate the index, so there is no re-embedding cost per edit. The index is a cache and is excluded from git via an auto-written `.memory/.gitignore`.
+> **Index persistence**: only each memory's `id + semantic title` is embedded and stored as metadata in `.memory/.index/index.json`, with the vectors in a flat binary file `.memory/.index/vectors.bin`. The semantic title is the first `# H1` heading of the content (the filename slug is used only as a fallback when the file has no H1). On the first injection of a session the index is brought in sync with the current files incrementally — new files are embedded, deleted files are dropped, files whose semantic title changed are re-embedded. Body edits that keep the H1 unchanged never invalidate the index, so routine edits cost no re-embedding. The index is a cache and is excluded from git via an auto-written `.memory/.gitignore`.
 
 ## Tools
 

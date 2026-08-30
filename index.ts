@@ -16,9 +16,9 @@ const execFileAsync = promisify(execFile)
  * - scope: omitted → root; all-modules → root + all modules (list/search only); <module> → that module's directory
  * - Read set: md_update / md_delete require the id to have been loaded via md_read, preventing changes to unseen content
  * - search: rg first, falls back to JS string matching
- * - Semantic injector (optional): embeds id+title of each memory into `.memory/.index/`, and on every user
- *   message matches it against the index via an embedding backend (python or remote), injecting a
- *   <memory_reference> block as context
+ * - Semantic injector (optional): embeds id + semantic title (first H1 heading of the content, filename
+ *   slug as fallback) of each memory into `.memory/.index/`, and on every user message matches it against
+ *   the index via an embedding backend (python or remote), injecting a <memory_reference> block as context
  */
 
 /** Plugin options — set via ["opencode-md-memory", { ... }] in opencode.json */
@@ -66,6 +66,9 @@ interface ResolvedConfig {
 
 /** Logging signature used by the plugin and the injector */
 type LogFn = (level: "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) => void
+
+/** Module-level log forwarder for the embed server's stdout; wired to app.log by the server factory */
+let clientLog: LogFn | null = null
 
 const readSet = new Set<string>()
 
@@ -337,7 +340,47 @@ interface LoadFailure {
   reason: "deps" | "model" | "remote"
 }
 
-let embedderState: { key: string; promise: Promise<LoadResult | LoadFailure> } | null = null
+let embedderState: { key: string; promise: Promise<LoadResult | LoadFailure>; ok: boolean } | null = null
+let lastLoadFailAt = 0
+let lastLoadFailReason: LoadFailure["reason"] = "model"
+const LOAD_FAIL_BACKOFF_MS = 30_000
+
+/** Reset the cached embedder so the next getEmbedder() call re-probes instead of reusing stale state */
+function resetEmbedder(): void {
+  embedderState = null
+}
+
+/**
+ * Wrap an embedder so a request failure self-heals: the cached load state is dropped and the
+ * backend is rebuilt (python: respawn/reuse the embed server; remote: re-create the client),
+ * then the request is retried once. Without this a stale cached embedder keeps POSTing to a
+ * dead port and every message of the session fails (2026-08-22 diagnosis).
+ */
+function makeSelfHealing(rebuild: () => Promise<Embedder>): Embedder {
+  let current: Embedder | null = null
+  const get = async (): Promise<Embedder> => {
+    if (!current) current = await rebuild()
+    return current
+  }
+  const retryable = async (texts: string[]): Promise<number[][]> => {
+    try {
+      return await (await get()).embedMany(texts)
+    } catch (e) {
+      current = null
+      resetEmbedder()
+      return await (await get()).embedMany(texts)
+    }
+  }
+  return {
+    async embed(text: string): Promise<number[]> {
+      const [vec] = await retryable([text])
+      return vec
+    },
+    async embedMany(texts: string[]): Promise<number[][]> {
+      return retryable(texts)
+    },
+  }
+}
 
 /** Resolve an apiKey that may be "{env:VAR}" or a plain secret, falling back to env var of the same name. */
 function resolveSecret(value: string | undefined): string | undefined {
@@ -349,6 +392,12 @@ function resolveSecret(value: string | undefined): string | undefined {
 }
 
 // --- Python embed server (local backend: spawn python/embed_server.py, call over HTTP) ---
+
+// 本地回环直连，绕过系统代理：嵌入服务死亡时即刻失败（~8ms ECONNREFUSED），
+// 而非经代理等待 ~3s 超时（2026-08-22 诊断：死端口 + 系统代理 = 每条消息 +3s 且注入失效）。
+const LOOPBACK_NO_PROXY = "127.0.0.1,localhost,::1"
+process.env.NO_PROXY = [process.env.NO_PROXY, LOOPBACK_NO_PROXY].filter(Boolean).join(",")
+process.env.no_proxy = [process.env.no_proxy, LOOPBACK_NO_PROXY].filter(Boolean).join(",")
 
 const PYTHON = process.env.PYTHON || "python3"
 const EMBED_SERVER_PORT = 48611
@@ -366,9 +415,20 @@ async function ensurePythonServer(modelName: string): Promise<string | null> {
   }
   pythonServer = spawn(PYTHON, [PYTHON_SCRIPT, "--port", String(EMBED_SERVER_PORT), "--model-name", modelName], {
     env: { ...process.env },
-    stdio: ["ignore", "ignore", "pipe"],
+    stdio: ["ignore", "pipe", "pipe"],
   })
   pythonServer.unref?.() // 插件退出不阻塞；服务靠 idle-timeout 自回收
+  pythonServer.stdout?.on("data", (d) => {
+    const line = String(d).trim().slice(0, 300)
+    if (!line) return
+    // 服务 stdout 是正常日志（model loaded/listening/[embed] 计时），走 info 级，不能当错误输出
+    try {
+      if (clientLog) clientLog("info", `embed server: ${line}`)
+      else console.log(`[opencode-md-memory] embed server: ${line}`)
+    } catch {
+      /* best-effort */
+    }
+  })
   pythonServer.stderr?.on("data", (d) => {
     console.error(`[opencode-md-memory] embed server stderr: ${String(d).trim().slice(0, 200)}`)
   })
@@ -442,28 +502,40 @@ function buildRemoteEmbedder(apiUrl: string, apiKey: string | undefined, model: 
 }
 
 /**
- * Lazily load the embedder for the configured backend. A failure is cached so repeated calls don't
- * hammer a dead endpoint; the returned reason distinguishes missing local deps, local model load
- * failure, and remote API failure.
+ * Lazily load the embedder for the configured backend. Only successful loads are cached; a
+ * failure resets the cache so the next call re-probes (instead of caching a dead endpoint,
+ * which would poison every message of the session). Self-healing retry is handled by the
+ * embedder itself (see makeSelfHealing).
  */
 function getEmbedder(config: ResolvedConfig): Promise<LoadResult | LoadFailure> {
   const key =
     config.embeddingBackend === "remote"
       ? `remote:${config.remoteApiUrl}:${config.embeddingModel}`
       : `python:${EMBED_SERVER_PORT}`
-  if (embedderState && embedderState.key === key) return embedderState.promise
+  if (embedderState && embedderState.key === key && embedderState.ok) return embedderState.promise
+  // Backoff: a permanently-dead backend is re-probed at most once per window. Otherwise every
+  // qualifying message would re-run the probe (python: up to 10s spawn wait; remote: a network
+  // round-trip), slowing each message and spamming spawn attempts.
+  if (Date.now() - lastLoadFailAt < LOAD_FAIL_BACKOFF_MS) {
+    return Promise.resolve({ ok: false, reason: lastLoadFailReason })
+  }
   const promise = (async (): Promise<LoadResult | LoadFailure> => {
     if (config.embeddingBackend === "remote") {
       if (!config.remoteApiUrl) return { ok: false, reason: "remote" }
       try {
-        const embedder = buildRemoteEmbedder(
+        // Eager probe OUTSIDE makeSelfHealing: a single attempt. Running it through the retry
+        // wrapper would double the spawn/probe work on a permanently-failing backend.
+        const raw = buildRemoteEmbedder(
           config.remoteApiUrl,
           resolveSecret(config.remoteApiKey),
           config.embeddingModel
         )
-        // Eager probe: surface auth/network/config errors now (as LoadFailure) instead of later
-        // inside syncIndex/query embedding, where they would leak through chat.message's catch.
-        await embedder.embed("ping")
+        await raw.embed("ping")
+        const embedder = makeSelfHealing(() =>
+          Promise.resolve(
+            buildRemoteEmbedder(config.remoteApiUrl!, resolveSecret(config.remoteApiKey), config.embeddingModel)
+          )
+        )
         return { ok: true, embedder }
       } catch {
         return { ok: false, reason: "remote" }
@@ -472,13 +544,27 @@ function getEmbedder(config: ResolvedConfig): Promise<LoadResult | LoadFailure> 
     try {
       const base = await ensurePythonServer(config.embeddingModel)
       if (!base) return { ok: false, reason: "model" }
-      return { ok: true, embedder: buildPythonEmbedder(base) }
+      const embedder = makeSelfHealing(async () => {
+        const b2 = await ensurePythonServer(config.embeddingModel)
+        if (!b2) throw new Error("python embed server unavailable")
+        return buildPythonEmbedder(b2)
+      })
+      return { ok: true, embedder }
     } catch (e) {
       console.error(`[opencode-md-memory] python embedder failed: ${(e as Error)?.message?.slice(0, 200)}`)
       return { ok: false, reason: "model" }
     }
   })()
-  embedderState = { key, promise }
+  embedderState = { key, promise, ok: false }
+  promise.then((r) => {
+    if (r.ok) {
+      embedderState = { key, promise, ok: true }
+    } else {
+      embedderState = null
+      lastLoadFailAt = Date.now()
+      lastLoadFailReason = r.reason
+    }
+  })
   return promise
 }
 
@@ -593,19 +679,53 @@ function titleFromFile(name: string, idPrefix: string): string {
   return rest || name.replace(/\.md$/i, "")
 }
 
+/** Semantic title of a memory: the first `# H1` heading of the content, falling back to the filename slug when absent */
+function extractTitle(content: string, name: string, idPrefix: string): string {
+  let body = content.replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n") // strip BOM, normalize CRLF
+  const fm = body.match(/^---\n[\s\S]*?\n---\n?/) // skip a leading YAML frontmatter block
+  if (fm) body = body.slice(fm[0].length)
+  // `[ \t]` (not `\s`) so the space class can't cross a newline; allows CommonMark's ≤3-space indent
+  const m = body.match(/^[ \t]{0,3}#[ \t]+([^\n]+?)[ \t]*#*[ \t]*$/m)
+  if (m) {
+    const title = m[1].trim()
+    if (title) return title
+  }
+  return titleFromFile(name, idPrefix)
+}
+
 /**
  * Bring the persisted index in sync with the current `.memory/` files (incremental):
  * new files are embedded and appended, files that no longer exist are dropped,
  * renamed files (changed title) are re-embedded. Returns the entry map.
  */
+let titleCache: { key: string; entries: Map<string, { mtimeMs: number; size: number; title: string }> } | null = null
+
 async function syncIndex(root: string, config: ResolvedConfig, embedder: Embedder): Promise<Map<string, IndexEntry>> {
   return withIndexLock(async () => {
     const files = await collectMd(root, config, "all-modules")
+    const cacheKey = `${root}:${config.idPrefix}:${config.storageName ?? ""}`
+    const prevTitleCache = titleCache?.key === cacheKey ? titleCache.entries : null
     const current = new Map<string, string>()
+    const newTitleCache = new Map<string, { mtimeMs: number; size: number; title: string }>()
     for (const f of files) {
       const id = idFromFile(path.basename(f), config.idPrefix)
-      if (id) current.set(id, titleFromFile(path.basename(f), config.idPrefix))
+      if (!id) continue
+      let title = titleFromFile(path.basename(f), config.idPrefix)
+      try {
+        const st = await fs.stat(f)
+        const cached = prevTitleCache?.get(f)
+        if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+          title = cached.title
+        } else {
+          title = extractTitle(await fs.readFile(f, "utf-8"), path.basename(f), config.idPrefix)
+        }
+        newTitleCache.set(f, { mtimeMs: st.mtimeMs, size: st.size, title })
+      } catch {
+        /* unreadable → keep the filename-derived fallback */
+      }
+      current.set(id, title)
     }
+    titleCache = { key: cacheKey, entries: newTitleCache }
 
     const entries = new Map<string, IndexEntry>()
     const prev = await readIndex(root, config)
@@ -707,6 +827,7 @@ export const server: Plugin = async (input, options: MdMemoryOptions = {}) => {
       /* logging is best-effort */
     }
   }
+  clientLog = log
 
   /** Per-session injection counter so a session never receives more than injectorMaxPerSession references */
   const injectorCounts = new Map<string, number>()

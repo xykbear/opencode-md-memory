@@ -109,7 +109,7 @@ pip install onnxruntime tokenizers numpy
 
 若嵌入服务（python）或 API（remote）不可用，注入器记录警告并跳过，不中断会话。
 
-> **索引持久化**：仅将每条记忆的 `id + title`（从文件名解析）嵌入并存储为 `.memory/.index/index.json` 中的元数据，向量存于扁平二进制文件 `.memory/.index/vectors.bin`。会话首次注入时，索引会与当前文件做增量同步——新文件嵌入追加、已删除文件移除、重命名文件重新嵌入。内容变更不会使索引失效，因此每次编辑都无需重嵌入。索引是缓存，通过自动写入的 `.memory/.gitignore` 排除在 git 之外。
+> **索引持久化**：仅将每条记忆的 `id + 语义标题` 嵌入并存储为 `.memory/.index/index.json` 中的元数据，向量存于扁平二进制文件 `.memory/.index/vectors.bin`。语义标题取正文首个 `# H1` 标题（文件无 H1 时回退用文件名 slug）。会话首次注入时，索引会与当前文件做增量同步——新文件嵌入追加、已删除文件移除、语义标题发生变化的文件重新嵌入。正文编辑若未改动 H1 则不会使索引失效，因此常规编辑无需重嵌入。索引是缓存，通过自动写入的 `.memory/.gitignore` 排除在 git 之外。
 
 ## 工具
 
