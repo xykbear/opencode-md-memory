@@ -1,5 +1,6 @@
-import { type Plugin, tool } from "@opencode-ai/plugin"
-import { promises as fs } from "fs"
+import { Plugin } from "@opencode/plugin"
+import { appendFileSync, promises as fs } from "fs"
+import { Logging } from "@opencode/util/observability/logging"
 import * as path from "path"
 import * as os from "os"
 import { execFile, spawn } from "child_process"
@@ -31,7 +32,7 @@ interface MdMemoryOptions {
   idPrefix?: string
   /** Max entries in the read-set (default 200) */
   maxReadSet?: number
-  /** Inject matching memory references into chat via the chat.message hook (requires optional deps). Default false */
+  /** Inject matching memory references into chat via the V2 prompt/context hooks (requires optional deps). Default false */
   injectorEnabled?: boolean
   /** Embedding backend: "remote" (OpenAI-compatible API) or "python" (local Python embed server). Default "remote" */
   embeddingBackend?: "remote" | "python"
@@ -67,8 +68,27 @@ interface ResolvedConfig {
 /** Logging signature used by the plugin and the injector */
 type LogFn = (level: "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) => void
 
-/** Module-level log forwarder for the embed server's stdout; wired to app.log by the server factory */
+/** Module-level log forwarder for the embed server's stdout; wired to console by the plugin setup */
 let clientLog: LogFn | null = null
+
+// --- 审计日志：写入 opencode 主日志（Logging.file(false)），受 OPENCODE_LOG_LEVEL 控制 ---
+// V2 Context 无 app.log；插件 console 在后台服务里落到 /dev/null。改用 @opencode/util 的 Logging，
+// 复用 opencode 主日志（append-only、自动裁剪）与既有日志级别开关（OPENCODE_LOG_LEVEL）。
+const AUDIT_TARGET = Logging.file(false)
+const LEVEL_RANK: Record<string, number> = { Error: 0, Warn: 1, Info: 2, Debug: 3 }
+
+/** 记一条注入审计日志到 opencode 主日志；低于 minimumLogLevel 的级别丢弃。 */
+function audit(level: "Info" | "Debug", message: string): void {
+  try {
+    if (LEVEL_RANK[level] > LEVEL_RANK[Logging.minimumLogLevel()]) return
+    appendFileSync(
+      AUDIT_TARGET,
+      `timestamp=${new Date().toISOString()} level=${level} run=opencode-md-memory message=${JSON.stringify(message)}\n`
+    )
+  } catch {
+    /* audit is best-effort */
+  }
+}
 
 const readSet = new Set<string>()
 
@@ -340,7 +360,7 @@ interface LoadFailure {
   reason: "deps" | "model" | "remote"
 }
 
-let embedderState: { key: string; promise: Promise<LoadResult | LoadFailure>; ok: boolean } | null = null
+let embedderState: { key: string; promise: Promise<LoadResult | LoadFailure> } | null = null
 let lastLoadFailAt = 0
 let lastLoadFailReason: LoadFailure["reason"] = "model"
 const LOAD_FAIL_BACKOFF_MS = 30_000
@@ -502,17 +522,19 @@ function buildRemoteEmbedder(apiUrl: string, apiKey: string | undefined, model: 
 }
 
 /**
- * Lazily load the embedder for the configured backend. Only successful loads are cached; a
- * failure resets the cache so the next call re-probes (instead of caching a dead endpoint,
- * which would poison every message of the session). Self-healing retry is handled by the
- * embedder itself (see makeSelfHealing).
+ * Lazily load the embedder for the configured backend. In-flight and successful loads are
+ * cached (concurrent callers share one promise — otherwise two ensurePythonServer calls race
+ * on the shared port); a failure resets the cache so the next call re-probes (instead of
+ * caching a dead endpoint, which would poison every message of the session). Self-healing
+ * retry is handled by the embedder itself (see makeSelfHealing).
  */
 function getEmbedder(config: ResolvedConfig): Promise<LoadResult | LoadFailure> {
   const key =
     config.embeddingBackend === "remote"
       ? `remote:${config.remoteApiUrl}:${config.embeddingModel}`
       : `python:${EMBED_SERVER_PORT}`
-  if (embedderState && embedderState.key === key && embedderState.ok) return embedderState.promise
+  // 复用同一 key 的 in-flight 或已成功 promise（避免并发二次 ensurePythonServer → 共享端口冲突）
+  if (embedderState && embedderState.key === key) return embedderState.promise
   // Backoff: a permanently-dead backend is re-probed at most once per window. Otherwise every
   // qualifying message would re-run the probe (python: up to 10s spawn wait; remote: a network
   // round-trip), slowing each message and spamming spawn attempts.
@@ -555,11 +577,9 @@ function getEmbedder(config: ResolvedConfig): Promise<LoadResult | LoadFailure> 
       return { ok: false, reason: "model" }
     }
   })()
-  embedderState = { key, promise, ok: false }
+  embedderState = { key, promise }
   promise.then((r) => {
-    if (r.ok) {
-      embedderState = { key, promise, ok: true }
-    } else {
+    if (!r.ok && embedderState?.promise === promise) {
       embedderState = null
       lastLoadFailAt = Date.now()
       lastLoadFailReason = r.reason
@@ -812,189 +832,233 @@ async function buildMemoryReference(
   return rows.length ? formatReference(rows) : null
 }
 
-export const server: Plugin = async (input, options: MdMemoryOptions = {}) => {
-  const config = resolveConfig(options)
-  const { idPrefix } = config
-  const projectDir = input.directory
+export default Plugin.define({
+  id: "opencode-md-memory",
+  async setup(ctx) {
+    const config = resolveConfig(ctx.options as MdMemoryOptions)
+    const { idPrefix } = config
+    const projectDir = ctx.location.directory
 
-  /** Log an event to the opencode log (debug level so routine operations stay quiet), swallowing failures. */
-  const log: LogFn = (level, message, extra) => {
-    try {
-      void input.client.app.log({
-        body: { service: "opencode-md-memory", level, message, extra },
-      })
-    } catch {
-      /* logging is best-effort */
+    /** Log an event (console → opencode log; best-effort). V2 Context has no app.log. */
+    const log: LogFn = (level, message, extra) => {
+      try {
+        const line = `[opencode-md-memory] ${message}${extra ? " " + JSON.stringify(extra) : ""}`
+        if (level === "error") console.error(line)
+        else if (level === "warn") console.warn(line)
+        else console.log(line)
+      } catch {
+        /* logging is best-effort */
+      }
     }
-  }
-  clientLog = log
+    clientLog = log
 
-  /** Per-session injection counter so a session never receives more than injectorMaxPerSession references */
-  const injectorCounts = new Map<string, number>()
+    /** Per-session injection counter so a session never receives more than injectorMaxPerSession references */
+    const injectorCounts = new Map<string, number>()
+    /** The injector block in effect for the current turn; set by the prompt hook, consumed by the context hook */
+    const activeBlock = new Map<string, string>()
 
-  return {
-    tool: {
-      md_create: tool({
+    await ctx.tool.transform((editor) => {
+      editor.add({
+        name: "md_create",
         description: "Create a new Markdown memory and return its id.",
-        args: {
-          name: tool.schema.string().describe("Filename slug (no / \\ :)"),
-          content: tool.schema.string().describe("Markdown body"),
-          scope: tool.schema.string().optional().describe("all-modules or a module name (omit for root)"),
+        input: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "Filename slug (no / \\ :)" },
+            content: { type: "string", description: "Markdown body" },
+            scope: { type: "string", description: "all-modules or a module name (omit for root)" },
+          },
+          required: ["name", "content"],
+          additionalProperties: false,
         },
-        async execute(args, context) {
+        execute: async (input) => {
+          const args = input as { name: string; content: string; scope?: string }
           try {
             if (args.scope === "all-modules") {
-              return `[error] scope=all-modules does not apply to md_create (specify a concrete module or omit).`
+              return { content: `[error] scope=all-modules does not apply to md_create (specify a concrete module or omit).` }
             }
             if (args.name.includes("/") || args.name.includes("\\") || args.name.includes(":")) {
-              return `[error] name must not contain / \\ or :${args.name}`
+              return { content: `[error] name must not contain / \\ or :${args.name}` }
             }
             if (!args.name.trim()) {
-              return `[error] name must not be empty.`
+              return { content: `[error] name must not be empty.` }
             }
             const scopeDir = scopeLabel(args.scope)
-            const id = await allocateId(context.directory, config, args.name, scopeDir)
+            const id = await allocateId(projectDir, config, args.name, scopeDir)
             const target = scopeDir
-              ? path.join(memoryRoot(context.directory, config), scopeDir, `${id}-${args.name}.md`)
-              : path.join(memoryRoot(context.directory, config), `${id}-${args.name}.md`)
+              ? path.join(memoryRoot(projectDir, config), scopeDir, `${id}-${args.name}.md`)
+              : path.join(memoryRoot(projectDir, config), `${id}-${args.name}.md`)
             await fs.writeFile(target, args.content, "utf-8")
             addToReadSet(id, config.maxReadSet)
-            return `created ${id} (${scopeDir ? scopeDir + "/" : ""}${id}-${args.name}.md)`
+            return { content: `created ${id} (${scopeDir ? scopeDir + "/" : ""}${id}-${args.name}.md)` }
           } catch (e) {
-            return `[error] ${(e as Error).message}`
+            return { content: `[error] ${(e as Error).message}` }
           }
         },
-      }),
+      })
 
-      md_read: tool({
+      editor.add({
+        name: "md_read",
         description: "Read a memory by id.",
-        args: {
-          id: tool.schema.string().describe("Memory id, e.g. mdm_3"),
+        input: {
+          type: "object",
+          properties: { id: { type: "string", description: "Memory id, e.g. mdm_3" } },
+          required: ["id"],
+          additionalProperties: false,
         },
-        async execute(args, context) {
+        execute: async (input) => {
+          const args = input as { id: string }
           try {
-            const abs = await locateById(context.directory, config, args.id)
-            if (!abs) return `[error] id=${args.id} not found`
+            const abs = await locateById(projectDir, config, args.id)
+            if (!abs) return { content: `[error] id=${args.id} not found` }
             const content = await fs.readFile(abs, "utf-8")
             addToReadSet(args.id, config.maxReadSet)
-            return content
+            return { content }
           } catch (e) {
-            return `[error] ${(e as Error).message}`
+            return { content: `[error] ${(e as Error).message}` }
           }
         },
-      }),
+      })
 
-      md_update: tool({
+      editor.add({
+        name: "md_update",
         description: "Overwrite a memory by id with new content.",
-        args: {
-          id: tool.schema.string().describe("Memory id, e.g. mdm_3"),
-          content: tool.schema.string().describe("New Markdown body"),
+        input: {
+          type: "object",
+          properties: {
+            id: { type: "string", description: "Memory id, e.g. mdm_3" },
+            content: { type: "string", description: "New Markdown body" },
+          },
+          required: ["id", "content"],
+          additionalProperties: false,
         },
-        async execute(args, context) {
+        execute: async (input) => {
+          const args = input as { id: string; content: string }
           try {
             if (!readSet.has(args.id)) {
               log("warn", `md_update gate denied for ${args.id} (not in read set)`)
-              return `[gate] id=${args.id} is not in the read set. Use md_read first to load it, then update.`
+              return { content: `[gate] id=${args.id} is not in the read set. Use md_read first to load it, then update.` }
             }
-            const abs = await locateById(context.directory, config, args.id)
-            if (!abs) return `[error] id=${args.id} not found`
+            const abs = await locateById(projectDir, config, args.id)
+            if (!abs) return { content: `[error] id=${args.id} not found` }
             await fs.writeFile(abs, args.content, "utf-8")
-            return `updated ${args.id}`
+            return { content: `updated ${args.id}` }
           } catch (e) {
             log("error", `md_update failed: ${(e as Error).message}`)
-            return `[error] ${(e as Error).message}`
+            return { content: `[error] ${(e as Error).message}` }
           }
         },
-      }),
+      })
 
-      md_delete: tool({
+      editor.add({
+        name: "md_delete",
         description: "Delete a memory by id.",
-        args: {
-          id: tool.schema.string().describe("Memory id, e.g. mdm_3"),
+        input: {
+          type: "object",
+          properties: { id: { type: "string", description: "Memory id, e.g. mdm_3" } },
+          required: ["id"],
+          additionalProperties: false,
         },
-        async execute(args, context) {
+        execute: async (input) => {
+          const args = input as { id: string }
           try {
             if (!readSet.has(args.id)) {
               log("warn", `md_delete gate denied for ${args.id} (not in read set)`)
-              return `[gate] id=${args.id} is not in the read set. Use md_read first to load it, then delete.`
+              return { content: `[gate] id=${args.id} is not in the read set. Use md_read first to load it, then delete.` }
             }
-            const abs = await locateById(context.directory, config, args.id)
-            if (!abs) return `[error] id=${args.id} not found`
+            const abs = await locateById(projectDir, config, args.id)
+            if (!abs) return { content: `[error] id=${args.id} not found` }
             await fs.unlink(abs)
             readSet.delete(args.id)
-            return `deleted ${args.id}`
+            return { content: `deleted ${args.id}` }
           } catch (e) {
             log("error", `md_delete failed: ${(e as Error).message}`)
-            return `[error] ${(e as Error).message}`
+            return { content: `[error] ${(e as Error).message}` }
           }
         },
-      }),
+      })
 
-      md_list: tool({
+      editor.add({
+        name: "md_list",
         description: "List memory files.",
-        args: {
-          scope: tool.schema.string().optional().describe("all-modules or a module name (omit for root)"),
+        input: {
+          type: "object",
+          properties: { scope: { type: "string", description: "all-modules or a module name (omit for root)" } },
+          required: [],
+          additionalProperties: false,
         },
-        async execute(args, context) {
+        execute: async (input) => {
+          const args = input as { scope?: string }
           try {
-            const files = await collectMd(context.directory, config, args.scope)
-            if (!files.length) return "(empty)"
-            return files
-              .map((f) => {
-                const id = idFromFile(path.basename(f), idPrefix)
-                const rel = path.relative(memoryRoot(context.directory, config), f).replace(/\\/g, "/")
-                return id ? `${id}  ${rel}` : rel
-              })
-              .join("\n")
+            const files = await collectMd(projectDir, config, args.scope)
+            if (!files.length) return { content: "(empty)" }
+            return {
+              content: files
+                .map((f) => {
+                  const id = idFromFile(path.basename(f), idPrefix)
+                  const rel = path.relative(memoryRoot(projectDir, config), f).replace(/\\/g, "/")
+                  return id ? `${id}  ${rel}` : rel
+                })
+                .join("\n"),
+            }
           } catch (e) {
-            return `[error] ${(e as Error).message}`
+            return { content: `[error] ${(e as Error).message}` }
           }
         },
-      }),
+      })
 
-      md_search: tool({
+      editor.add({
+        name: "md_search",
         description: "Full-text search across memory content.",
-        args: {
-          query: tool.schema.string().describe("Search keyword"),
-          scope: tool.schema.string().optional().describe("all-modules or a module name (omit for root)"),
+        input: {
+          type: "object",
+          properties: {
+            query: { type: "string", description: "Search keyword" },
+            scope: { type: "string", description: "all-modules or a module name (omit for root)" },
+          },
+          required: ["query"],
+          additionalProperties: false,
         },
-        async execute(args, context) {
+        execute: async (input) => {
+          const args = input as { query: string; scope?: string }
           try {
-            const results = await runSearch(context.directory, config, args.scope, args.query)
-            return results.length ? results.join("\n\n") : "(no match)"
+            const results = await runSearch(projectDir, config, args.scope, args.query)
+            return { content: results.length ? results.join("\n\n") : "(no match)" }
           } catch (e) {
-            return `[error] ${(e as Error).message}`
+            return { content: `[error] ${(e as Error).message}` }
           }
         },
-      }),
-    },
-    "chat.message": async (hookInput, hookOutput) => {
+      })
+    })
+
+    // V2 注入：prompt hook 只做匹配并登记「本轮生效块」（不改用户文本）；context hook 将其
+    // 注入模型请求的 request.system（非用户、不持久化）。替代 V1 的 chat.message synthetic
+    // text part（V2 Message 无 synthetic 标记）。
+    await ctx.session.hook("prompt", async (event) => {
       if (!config.injectorEnabled) return
+      const sessionID = event.sessionID
+      activeBlock.delete(sessionID)
       try {
-        const text = hookOutput.parts
-          .filter((p) => p.type === "text")
-          .map((p) => (p as { text?: string }).text ?? "")
-          .join("\n")
-          .trim()
+        const text = (event.prompt.text ?? "").trim()
         if (text.length < config.injectorMinLen) return
-        const used = injectorCounts.get(hookInput.sessionID) ?? 0
+        const used = injectorCounts.get(sessionID) ?? 0
         if (used >= config.injectorMaxPerSession) return
         const reference = await buildMemoryReference(projectDir, config, text, config.injectorTopK, log)
         if (!reference) return
-        injectorCounts.set(hookInput.sessionID, used + 1)
-        hookOutput.parts.unshift({
-          id: `prt-md-memory-${Date.now()}`,
-          sessionID: hookInput.sessionID,
-          messageID: hookOutput.message.id,
-          type: "text",
-          text: reference,
-          synthetic: true,
-        })
+        injectorCounts.set(sessionID, used + 1)
+        activeBlock.set(sessionID, reference)
+        const refLines = reference.split("\n").filter((l) => l.startsWith("- "))
+        audit("Info", `inject session=${sessionID} n=${refLines.length} top="${(refLines[0] ?? "").slice(2, 62)}"`)
+        audit("Debug", `inject block session=${sessionID} ${JSON.stringify(reference)}`)
       } catch (e) {
-        log("error", `chat.message injector failed: ${(e as Error).message}`)
+        log("error", `prompt injector failed: ${(e as Error).message}`)
       }
-    },
-  }
-}
+    })
 
-export default server
+    await ctx.session.hook("context", (event) => {
+      const block = activeBlock.get(event.sessionID)
+      if (!block) return
+      event.system.push({ type: "text", text: block })
+    })
+  },
+})
