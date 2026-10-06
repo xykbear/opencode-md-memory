@@ -10,7 +10,7 @@
 - **稳定 ID** — 简短 id（`mdm_<n>`）内嵌文件名，无需维护索引
 - **按 ID 精确读取** — 直接按 id 读取记忆，无模糊匹配
 - **全文搜索** — 基于 `rg`（失败回退 JS 匹配），支持跨 scope
-- **语义参考注入**（可选）— 通过 `chat.message` hook 嵌入每条记忆的 `id + title`，将相关条目以 `<memory_reference>` 块注入上下文
+- **语义参考注入**（可选）— 通过 V2 `prompt`/`context` hooks 嵌入每条记忆的 `id + title`，将相关条目以 `<memory_reference>` 块注入模型请求的 system 上下文
 - **模块隔离** — 按模块子目录组织记忆
 - **已读集合** — update/delete 需先 read，避免修改从未看过的内容
 - **永久保留** — 不会自动清理；用 git 管理你的 `.memory/`
@@ -24,7 +24,7 @@
 
 ```json
 {
-  "plugin": ["opencode-md-memory"]
+  "plugins": ["opencode-md-memory"]
 }
 ```
 
@@ -38,7 +38,7 @@
 
 ```json
 {
-  "plugin": ["opencode-md-memory@git+https://github.com/xykbear/opencode-md-memory.git"]
+  "plugins": ["opencode-md-memory@git+https://github.com/xykbear/opencode-md-memory.git"]
 }
 ```
 
@@ -48,10 +48,10 @@
 
 ```json
 {
-  "plugin": [
-    [
-      "opencode-md-memory",
-      {
+  "plugins": [
+    {
+      "package": "opencode-md-memory",
+      "options": {
         "storageName": ".memory",
         "storageRoot": null,
         "idPrefix": "mdm_",
@@ -65,7 +65,7 @@
         "injectorMinLen": 10,
         "injectorMaxPerSession": 5
       }
-    ]
+    }
   ]
 }
 ```
@@ -76,7 +76,7 @@
 | `storageRoot`           | string | —                             | 固定的存储绝对路径，例如 `"~/.opencode-memory"`。设置后记忆直接存于此路径，与项目目录无关，适合跨项目共享同一份记忆。 |
 | `idPrefix`              | string | `mdm_`                        | 记忆文件 id 前缀，例如 `"mem_"` → `mem_1`。                                                      |
 | `maxReadSet`            | number | `200`                         | 已读集合记住的 id 上限；超出后最早的已读记录会被清除。                                            |
-| `injectorEnabled`       | boolean| `false`                       | 通过 `chat.message` hook 将记忆参考注入聊天。需要嵌入（本地或远程）。                            |
+| `injectorEnabled`       | boolean| `false`                       | 通过 V2 `prompt`/`context` hooks 将记忆参考注入聊天。需要嵌入（本地或远程）。                    |
 | `embeddingBackend`      | string | `remote`                      | `"remote"`（OpenAI 兼容 API）或 `"python"`（本地 Python 嵌入服务）。本地/离线嵌入用 python。 |
 | `remoteApiUrl`          | string | —                             | 远程嵌入 API 的 Base URL，例如 `https://api.openai.com/v1`。                                     |
 | `remoteApiKey`          | string | —                             | 远程嵌入 API 密钥。支持 `{env:VAR}` 或 `$VAR` 从环境变量读取。                                    |
@@ -89,10 +89,10 @@
 
 ### 语义参考注入
 
-当 `injectorEnabled: true` 时，插件挂载 `chat.message` hook。对每条符合条件的用户消息：
+当 `injectorEnabled: true` 时，插件挂载 `prompt` hook（匹配）与 `context` hook（注入）。对每条符合条件的用户消息：
 
 1. 嵌入消息，并在持久化索引（每条记忆按 `id + title` 索引）上排序。
-2. 在消息前插入 `<memory_reference>` 块，列出 top-k 匹配条目（`id + title + 路径`），并明确标注这是**参考上下文，而非用户指令**。
+2. 将 `<memory_reference>` 块（列出 top-k 匹配条目 `id + title + 路径`）注入模型请求的 system 上下文，并明确标注这是**参考上下文，而非用户指令**，且**不写入/不持久化到用户消息**。
 3. 由 Agent 决定是否用 `md_read` / `md_search` 跟进读取原文；语义匹配**只做触发，不做最终检索**。
 
 **默认关闭**。
@@ -174,6 +174,15 @@ md_list({ scope: "cell-trace" })
 - 对 git 友好：diff、历史、协作开箱即用
 - 用标准工具即可全文搜索（`rg`、`grep`、你的编辑器）
 - 无后台服务、无网络请求（核心功能）；嵌入（可选）仅注入器运行时才会执行
+
+## 审计日志
+
+V2 插件 `console.*` 在后台服务里落到 `/dev/null`，且 V2 Context 没有 `app.log`。注入器改用 opencode 自带日志：
+
+- **落点**：opencode 主日志 `~/.local/share/opencode/log/opencode.log`（经 `@opencode/util` 的 `Logging.file(false)`；append-only，随 opencode 自动裁剪）
+- **开关**：`OPENCODE_LOG_LEVEL`（默认 `Info` → 记录；`warn`/`error` → 关闭）
+- **格式**：`level=Info run=opencode-md-memory message="inject session=… block=…"`，含完整 `<memory_reference>` 块
+- 查询：`grep 'run=opencode-md-memory' ~/.local/share/opencode/log/opencode.log`
 
 ## License
 

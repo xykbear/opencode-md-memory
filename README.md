@@ -10,7 +10,7 @@ No vector database, no auto-cleanup — memories are just `.md` files you can re
 - **Stable ids** — short ids (`mdm_<n>`) embedded in filenames, no index to maintain
 - **Exact read by id** — read a memory directly by its id, no fuzzy matching
 - **Full-text search** — `rg`-powered (falls back to JS matching), across scopes
-- **Semantic reference injection** (optional) — the `chat.message` hook embeds each memory's `id + title` and injects a `<memory_reference>` block of related entries as context
+- **Semantic reference injection** (optional) — the V2 `prompt`/`context` hooks embed each memory's `id + title` and inject a `<memory_reference>` block of related entries into the model request's system context
 - **Module scoping** — organize memories into per-module subdirectories
 - **Read set** — update/delete require the id to be read first, preventing changes to content never seen
 - **Permanent by design** — nothing is auto-deleted; version your `.memory/` with git
@@ -24,7 +24,7 @@ Add to `~/.config/opencode/opencode.json`:
 
 ```json
 {
-  "plugin": ["opencode-md-memory"]
+  "plugins": ["opencode-md-memory"]
 }
 ```
 
@@ -38,7 +38,7 @@ Copy `index.ts` into `~/.config/opencode/plugins/` (global) or `.opencode/plugin
 
 ```json
 {
-  "plugin": ["opencode-md-memory@git+https://github.com/xykbear/opencode-md-memory.git"]
+  "plugins": ["opencode-md-memory@git+https://github.com/xykbear/opencode-md-memory.git"]
 }
 ```
 
@@ -48,10 +48,10 @@ All options are optional; defaults are shown.
 
 ```json
 {
-  "plugin": [
-    [
-      "opencode-md-memory",
-      {
+  "plugins": [
+    {
+      "package": "opencode-md-memory",
+      "options": {
         "storageName": ".memory",
         "storageRoot": null,
         "idPrefix": "mdm_",
@@ -65,7 +65,7 @@ All options are optional; defaults are shown.
         "injectorMinLen": 10,
         "injectorMaxPerSession": 5
       }
-    ]
+    }
   ]
 }
 ```
@@ -76,7 +76,7 @@ All options are optional; defaults are shown.
 | `storageRoot`         | string | —                           | Fixed absolute path for storage, e.g. `"~/.opencode-memory"`. When set, memories are stored there directly, independent of the project directory. Useful to share one memory store across projects. |
 | `idPrefix`            | string | `mdm_`                      | Prefix for memory file ids, e.g. `"mem_"` → `mem_1`.                         |
 | `maxReadSet`          | number | `200`                       | Max ids the read set remembers; older read records are evicted beyond this. |
-| `injectorEnabled`     | boolean| `false`                     | Inject memory references into chat via the `chat.message` hook. Requires embedding (python or remote). |
+| `injectorEnabled`     | boolean| `false`                     | Inject memory references into chat via the V2 `prompt`/`context` hooks. Requires embedding (python or remote). |
 | `embeddingBackend`    | string | `remote`                     | `"remote"` (OpenAI-compatible API) or `"python"` (local Python embed server). Use python for offline/local embeddings. |
 | `remoteApiUrl`        | string | —                           | Base URL for the remote embeddings API, e.g. `https://api.openai.com/v1`.    |
 | `remoteApiKey`        | string | —                           | API key for remote embeddings. Supports `{env:VAR}` or `$VAR` to read from environment. |
@@ -89,10 +89,10 @@ All options are optional; defaults are shown.
 
 ### Semantic reference injection
 
-When `injectorEnabled: true`, the plugin hooks `chat.message`. For each qualifying user message it:
+When `injectorEnabled: true`, the plugin registers a `prompt` hook (match) and a `context` hook (inject). For each qualifying user message it:
 
 1. Embeds the message and ranks the persisted index (each memory indexed by `id + title`).
-2. Prepends a `<memory_reference>` block listing the top-k matching entries (`id + title + path`) as *reference context* — explicitly **not** an instruction from the user.
+2. Injects a `<memory_reference>` block listing the top-k matching entries (`id + title + path`) into the model request's system context, as *reference context* — explicitly **not** an instruction from the user, and **not** persisted into the user's message.
 3. Lets the agent decide whether to follow up with `md_read` / `md_search`; semantic matching is **trigger only**, never a substitute for reading the actual content.
 
 It is **disabled by default**.
@@ -174,6 +174,16 @@ md_list({ scope: "cell-trace" })
 - `git`-friendly: diffs, history, and collaboration work out of the box.
 - Fully searchable with standard tools (`rg`, `grep`, your editor).
 - No background service and no network round-trips for the core; embeddings (optional) only run for the injector.
+
+## Audit log
+
+V2 plugins' `console.*` goes to `/dev/null` under the background service, and the V2 plugin Context has no
+`app.log`. The injector reuses opencode's own logging instead:
+
+- **Sink**: opencode main log `~/.local/share/opencode/log/opencode.log` (via `@opencode/util`'s `Logging.file(false)`; append-only, auto-trimmed by opencode).
+- **Switch**: `OPENCODE_LOG_LEVEL` (default `Info` → logged; `warn`/`error` → off).
+- **Format**: `level=Info run=opencode-md-memory message="inject session=… block=…"`, including the full injected `<memory_reference>` block.
+- Query: `grep 'run=opencode-md-memory' ~/.local/share/opencode/log/opencode.log`
 
 ## License
 
