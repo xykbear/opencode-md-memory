@@ -57,10 +57,10 @@ All options are optional; defaults are shown.
         "idPrefix": "mdm_",
         "maxReadSet": 200,
         "injectorEnabled": false,
-        "embeddingBackend": "remote",
-        "remoteApiUrl": "https://api.openai.com/v1",
-        "remoteApiKey": "{env:OPENAI_API_KEY}",
-        "embeddingModel": "nomic-embed-text-v1",
+        "embeddingBackend": "endpoint",
+        "embeddingBaseUrl": "https://api.openai.com/v1",
+        "embeddingApiKey": "{env:OPENAI_API_KEY}",
+        "embeddingModel": "embeddinggemma-2",
         "injectorTopK": 3,
         "injectorMinLen": 10,
         "injectorMaxPerSession": 5
@@ -76,11 +76,11 @@ All options are optional; defaults are shown.
 | `storageRoot`         | string | —                           | Fixed absolute path for storage, e.g. `"~/.opencode-memory"`. When set, memories are stored there directly, independent of the project directory. Useful to share one memory store across projects. |
 | `idPrefix`            | string | `mdm_`                      | Prefix for memory file ids, e.g. `"mem_"` → `mem_1`.                         |
 | `maxReadSet`          | number | `200`                       | Max ids the read set remembers; older read records are evicted beyond this. |
-| `injectorEnabled`     | boolean| `false`                     | Inject memory references into chat via the `chat.message` hook. Requires embedding (python or remote). |
-| `embeddingBackend`    | string | `remote`                     | `"remote"` (OpenAI-compatible API) or `"python"` (local Python embed server). Use python for offline/local embeddings. |
-| `remoteApiUrl`        | string | —                           | Base URL for the remote embeddings API, e.g. `https://api.openai.com/v1`.    |
-| `remoteApiKey`        | string | —                           | API key for remote embeddings. Supports `{env:VAR}` or `$VAR` to read from environment. |
-| `embeddingModel`      | string | `nomic-embed-text-v1`       | Embedding model id. For remote backend, passed to the API. For python backend, resolves to `~/.opencode-md-memory/models/{model}/onnx/`. |
+| `injectorEnabled`     | boolean| `false`                     | Inject memory references into chat via the `chat.message` hook. Requires an embeddings backend. |
+| `embeddingBackend`    | string | `builtin`                   | `"builtin"` (plugin-managed local service; self-contained model) or `"endpoint"` (any external OpenAI-compatible service: llama.cpp / Ollama / TEI / LM Studio / OpenAI). |
+| `embeddingBaseUrl`    | string | —                           | Base URL for an `"endpoint"` backend, e.g. `http://127.0.0.1:8080/v1` (llama.cpp) or `https://api.openai.com/v1`. |
+| `embeddingApiKey`     | string | —                           | API key for an `"endpoint"` backend. Supports `{env:VAR}` or `$VAR` to read from environment. |
+| `embeddingModel`      | string | `embeddinggemma-2`          | Embedding model id — passed to the endpoint; for `builtin` it names the local model dir (`~/.opencode-md-memory/models/<model>/onnx`). |
 | `injectorTopK`        | number | `3`                         | Max references injected per triggering message.                              |
 | `injectorMinLen`      | number | `10`                        | Min message length (chars) that triggers injection; shorter messages are skipped. |
 | `injectorMaxPerSession` | number | `5`                       | Max injections per session, preventing context bloat.                        |
@@ -97,19 +97,27 @@ When `injectorEnabled: true`, the plugin hooks `chat.message`. For each qualifyi
 
 It is **disabled by default**.
 
-**Remote backend** (default): set `embeddingBackend: "remote"` with `remoteApiUrl`, `remoteApiKey`, and `embeddingModel`. The injector calls the OpenAI-compatible `/embeddings` endpoint. `remoteApiKey` accepts `{env:VAR}` or `$VAR` to read the key from the environment instead of storing it in `opencode.json`.
+**Unified interface** — every backend speaks the OpenAI-compatible `POST {base}/embeddings` API (`{model, input}` → `{data:[{embedding}]}`) — the same protocol as llama.cpp / Ollama / TEI / LM Studio / OpenAI. The plugin never depends on a specific runtime or a shared model path.
 
-**Python backend**: for local/offline embeddings, set `embeddingBackend: "python"`. The plugin spawns `python/embed_server.py` (bundled with the package), which loads an ONNX embedding model via onnxruntime + tokenizers and serves a local HTTP `/embed` endpoint. Requires:
+**`builtin`** (default): zero-config local embeddings. The plugin spawns the bundled `python/embed_server.py`, which serves that API locally and **auto-downloads** the model on first use into `~/.opencode-md-memory/models/<model>/onnx`. Requires the Python deps:
 
 ```bash
 pip install onnxruntime tokenizers numpy
 ```
 
-The model defaults to `~/.opencode-md-memory/models/nomic-embed-text-v1` — download `Xenova/nomic-embed-text-v1` from Hugging Face and extract it there. Override the location with `MDM_EMBED_MODEL_DIR` (or `EMBED_MODEL_DIR`) if your model lives elsewhere. Use `PYTHON` to point at a specific interpreter if `python3` lacks the deps.
+Override the model location with `MDM_EMBED_MODEL_DIR` (or `EMBED_MODEL_DIR`); disable auto-download with `MDM_EMBED_AUTO_FETCH=0`; use `PYTHON` to pick an interpreter; set `HF_ENDPOINT` for a download mirror.
 
-If the embed server (python) or the API (remote) are unavailable, the injector logs a warning and skips instead of failing the session.
+**`endpoint`**: point at any OpenAI-compatible embeddings service you already run — e.g. a **llama.cpp** server hosting EmbeddingGemma-2:
 
-> **Index persistence**: only each memory's `id + semantic title` is embedded and stored as metadata in `.memory/.index/index.json`, with the vectors in a flat binary file `.memory/.index/vectors.bin`. The semantic title is the first `# H1` heading of the content (the filename slug is used only as a fallback when the file has no H1). On the first injection of a session the index is brought in sync with the current files incrementally — new files are embedded, deleted files are dropped, files whose semantic title changed are re-embedded. Body edits that keep the H1 unchanged never invalidate the index, so routine edits cost no re-embedding. The index is a cache and is excluded from git via an auto-written `.memory/.gitignore`.
+```jsonc
+{ "embeddingBackend": "endpoint", "embeddingBaseUrl": "http://127.0.0.1:8080/v1", "embeddingModel": "embeddinggemma-2" }
+```
+
+(also works with Ollama `/v1`, TEI, LM Studio, OpenAI). `embeddingApiKey` accepts `{env:VAR}` or `$VAR`.
+
+If the backend is unavailable, the injector logs a warning and skips instead of failing the session.
+
+> **Index persistence**: only each memory's `id + semantic title` is embedded and stored as metadata in `.memory/.index/index.json`, with the vectors in a flat binary file `.memory/.index/vectors.bin`. The semantic title is the first `# H1` heading of the content (the filename slug is used only as a fallback when the file has no H1). On the first injection of a session the index is brought in sync with the current files incrementally — new files are embedded, deleted files are dropped, files whose semantic title changed are re-embedded. Body edits that keep the H1 unchanged never invalidate the index, so routine edits cost no re-embedding. The index also records its **embedding-space identity**: if the model changes (including a dimension-preserving swap, e.g. nomic→EmbeddingGemma-2), the whole index is rebuilt on the next session instead of mixing vectors from two spaces. The index is a cache and is excluded from git via an auto-written `.memory/.gitignore`.
 
 ## Tools
 

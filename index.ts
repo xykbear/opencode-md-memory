@@ -33,14 +33,17 @@ interface MdMemoryOptions {
   maxReadSet?: number
   /** Inject matching memory references into chat via the chat.message hook (requires optional deps). Default false */
   injectorEnabled?: boolean
-  /** Embedding backend: "remote" (OpenAI-compatible API) or "python" (local Python embed server). Default "remote" */
-  embeddingBackend?: "remote" | "python"
-  /** Base URL for remote embeddings API, e.g. https://api.openai.com/v1 */
-  remoteApiUrl?: string
-  /** API key for remote embeddings. Supports {env:VAR} to read from environment */
-  remoteApiKey?: string
-  /** Embedding model id, used for both remote API and local python model path resolution (default "nomic-embed-text-v1") */
+  /** Embedding backend — how the OpenAI-compatible embeddings service is provided:
+   *  "builtin" (plugin-managed local service; self-contained model) or
+   *  "endpoint" (any external OpenAI-compatible service: llama.cpp / Ollama / TEI / LM Studio / OpenAI).
+   *  Default "builtin". */
+  embeddingBackend?: "builtin" | "endpoint"
+  /** Embedding model id / local model name (default "embeddinggemma-2") */
   embeddingModel?: string
+  /** Base URL for an "endpoint" backend, e.g. http://127.0.0.1:8080/v1 or https://api.openai.com/v1 */
+  embeddingBaseUrl?: string
+  /** API key for an "endpoint" backend. Supports {env:VAR} to read from environment */
+  embeddingApiKey?: string
   /** Top-k references injected per message (default 3) */
   injectorTopK?: number
   /** Minimum message length (chars) to trigger injection (default 10) */
@@ -55,10 +58,10 @@ interface ResolvedConfig {
   idPrefix: string
   maxReadSet: number
   injectorEnabled: boolean
-  embeddingBackend: "remote" | "python"
-  remoteApiUrl?: string
-  remoteApiKey?: string
+  embeddingBackend: "builtin" | "endpoint"
   embeddingModel: string
+  embeddingBaseUrl?: string
+  embeddingApiKey?: string
   injectorTopK: number
   injectorMinLen: number
   injectorMaxPerSession: number
@@ -67,7 +70,7 @@ interface ResolvedConfig {
 /** Logging signature used by the plugin and the injector */
 type LogFn = (level: "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) => void
 
-/** Module-level log forwarder for the embed server's stdout; wired to app.log by the server factory */
+/** Module-level log forwarder for the embeddings service's stdout; wired to app.log by the server factory */
 let clientLog: LogFn | null = null
 
 const readSet = new Set<string>()
@@ -106,10 +109,10 @@ function resolveConfig(options: MdMemoryOptions): ResolvedConfig {
     idPrefix: options.idPrefix ?? "mdm_",
     maxReadSet: options.maxReadSet ?? 200,
     injectorEnabled: options.injectorEnabled ?? false,
-    embeddingBackend: options.embeddingBackend ?? "remote",
-    remoteApiUrl: options.remoteApiUrl?.replace(/\/+$/, ""),
-    remoteApiKey: options.remoteApiKey,
-    embeddingModel: options.embeddingModel ?? "nomic-embed-text-v1",
+    embeddingBackend: options.embeddingBackend ?? "builtin",
+    embeddingModel: options.embeddingModel ?? "embeddinggemma-2",
+    embeddingBaseUrl: options.embeddingBaseUrl?.replace(/\/+$/, ""),
+    embeddingApiKey: options.embeddingApiKey,
     injectorTopK: options.injectorTopK ?? 3,
     injectorMinLen: options.injectorMinLen ?? 10,
     injectorMaxPerSession: options.injectorMaxPerSession ?? 5,
@@ -323,11 +326,15 @@ async function runSearch(root: string, config: ResolvedConfig, scope: string | u
   return out
 }
 
-// --- Embedding backends (python local server or remote OpenAI-compatible API) ---
+// --- Builtin embeddings service (spawn python/embed_server.py, call the OpenAI-compatible /v1 API) ---
 
 interface Embedder {
   embed(text: string): Promise<number[]>
   embedMany(texts: string[]): Promise<number[][]>
+  /** Identity of the embedding space (backend + model). Lets the index rebuild when the model
+   *  changes — including dimension-preserving swaps (nomic-768 → embeddinggemma-2-768), where a
+   *  dim-only check would silently mix vectors from two different spaces. */
+  modelKey?: string
 }
 
 interface LoadResult {
@@ -337,7 +344,7 @@ interface LoadResult {
 }
 interface LoadFailure {
   ok: false
-  reason: "deps" | "model" | "remote"
+  reason: "deps" | "model" | "endpoint"
 }
 
 let embedderState: { key: string; promise: Promise<LoadResult | LoadFailure>; ok: boolean } | null = null
@@ -352,11 +359,11 @@ function resetEmbedder(): void {
 
 /**
  * Wrap an embedder so a request failure self-heals: the cached load state is dropped and the
- * backend is rebuilt (python: respawn/reuse the embed server; remote: re-create the client),
+ * backend is rebuilt (builtin: respawn/reuse the local service; endpoint: re-create the client),
  * then the request is retried once. Without this a stale cached embedder keeps POSTing to a
  * dead port and every message of the session fails (2026-08-22 diagnosis).
  */
-function makeSelfHealing(rebuild: () => Promise<Embedder>): Embedder {
+function makeSelfHealing(rebuild: () => Promise<Embedder>, initialModelKey?: string): Embedder {
   let current: Embedder | null = null
   const get = async (): Promise<Embedder> => {
     if (!current) current = await rebuild()
@@ -378,6 +385,9 @@ function makeSelfHealing(rebuild: () => Promise<Embedder>): Embedder {
     },
     async embedMany(texts: string[]): Promise<number[][]> {
       return retryable(texts)
+    },
+    get modelKey(): string | undefined {
+      return current?.modelKey ?? initialModelKey
     },
   }
 }
@@ -404,15 +414,29 @@ const EMBED_SERVER_PORT = 48611
 const PYTHON_SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), "python", "embed_server.py")
 let pythonServer: ReturnType<typeof spawn> | null = null
 
-/** Ensure the Python embed server is running; returns its base URL or null. */
-async function ensurePythonServer(modelName: string): Promise<string | null> {
-  const url = `http://127.0.0.1:${EMBED_SERVER_PORT}`
+/** Probe a running embeddings service's /health; returns its URL + reported model identity (or null). */
+async function probeHealth(url: string): Promise<{ url: string; modelKey?: string } | null> {
   try {
     const res = await fetch(`${url}/health`)
-    if (res.ok) return url
+    if (!res.ok) return null
+    let modelKey: string | undefined
+    try {
+      const j = (await res.json()) as { model?: string }
+      if (j?.model) modelKey = `builtin:${j.model}`
+    } catch {
+      /* some providers have no /health or a different shape */
+    }
+    return { url, modelKey }
   } catch {
-    /* not running */
+    return null
   }
+}
+
+/** Ensure the bundled local service is running; returns its OpenAI base URL + model identity, or null. */
+async function ensureBuiltinService(modelName: string): Promise<{ baseUrl: string; modelKey?: string } | null> {
+  const url = `http://127.0.0.1:${EMBED_SERVER_PORT}`
+  const running = await probeHealth(url)
+  if (running) return { baseUrl: `${url}/v1`, modelKey: running.modelKey }
   pythonServer = spawn(PYTHON, [PYTHON_SCRIPT, "--port", String(EMBED_SERVER_PORT), "--model-name", modelName], {
     env: { ...process.env },
     stdio: ["ignore", "pipe", "pipe"],
@@ -423,59 +447,36 @@ async function ensurePythonServer(modelName: string): Promise<string | null> {
     if (!line) return
     // 服务 stdout 是正常日志（model loaded/listening/[embed] 计时），走 info 级，不能当错误输出
     try {
-      if (clientLog) clientLog("info", `embed server: ${line}`)
-      else console.log(`[opencode-md-memory] embed server: ${line}`)
+      if (clientLog) clientLog("info", `embeddings service: ${line}`)
+      else console.log(`[opencode-md-memory] embeddings service: ${line}`)
     } catch {
       /* best-effort */
     }
   })
   pythonServer.stderr?.on("data", (d) => {
-    console.error(`[opencode-md-memory] embed server stderr: ${String(d).trim().slice(0, 200)}`)
+    console.error(`[opencode-md-memory] embeddings service stderr: ${String(d).trim().slice(0, 200)}`)
   })
   pythonServer.on("error", (e) => {
-    // 端口被占（另一插件已起服务）等：忽略，靠 health 探测复用
-    console.error(`[opencode-md-memory] embed server spawn error: ${e.message}`)
+    // 端口被占（另一消费者已起服务）等：忽略，靠 health 探测复用
+    console.error(`[opencode-md-memory] embeddings service spawn error: ${e.message}`)
   })
   for (let i = 0; i < 50; i++) {
     await new Promise((r) => setTimeout(r, 200))
-    try {
-      const res = await fetch(`${url}/health`)
-      if (res.ok) return url
-    } catch {
-      /* retry */
-    }
+    const ready = await probeHealth(url)
+    if (ready) return { baseUrl: `${url}/v1`, modelKey: ready.modelKey }
   }
   pythonServer?.kill()
   pythonServer = null
   return null
 }
 
-/** Build an embedder that talks to the Python embed server. */
-function buildPythonEmbedder(base: string): Embedder {
-  const embedMany = async (texts: string[]): Promise<number[][]> => {
-    const res = await fetch(`${base}/embed`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ texts }),
-    })
-    if (!res.ok) throw new Error(`embed server ${res.status}`)
-    const data = (await res.json()) as { vectors: number[][] }
-    return data.vectors
-  }
-  return {
-    async embed(text: string): Promise<number[]> {
-      const [v] = await embedMany([text])
-      return v
-    },
-    async embedMany(texts: string[]): Promise<number[][]> {
-      return embedMany(texts)
-    },
-  }
-}
-
-/** Build a remote OpenAI-compatible embeddings embedder. */
-function buildRemoteEmbedder(apiUrl: string, apiKey: string | undefined, model: string): Embedder {
-  const url = `${apiUrl}/embeddings`
+/**
+ * Build an embedder over the OpenAI-compatible `POST {baseUrl}/embeddings` API. This is the ONE
+ * client used by every backend (the builtin local service, llama.cpp, Ollama, TEI, LM Studio,
+ * OpenAI) — so the plugin only ever depends on the generic interface, never a specific runtime.
+ */
+function buildOpenAIEmbedder(baseUrl: string, apiKey: string | undefined, model: string, modelKey?: string): Embedder {
+  const url = `${baseUrl}/embeddings`
   const headers: Record<string, string> = { "Content-Type": "application/json" }
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`
   const request = async (input: string | string[]): Promise<number[][]> => {
@@ -484,9 +485,7 @@ function buildRemoteEmbedder(apiUrl: string, apiKey: string | undefined, model: 
       headers,
       body: JSON.stringify({ model, input }),
     })
-    if (!res.ok) {
-      throw new Error(`remote embeddings ${res.status}: ${(await res.text()).slice(0, 200)}`)
-    }
+    if (!res.ok) throw new Error(`embeddings ${res.status}: ${(await res.text()).slice(0, 200)}`)
     const data = (await res.json()) as { data: { embedding: number[] }[] }
     return data.data.map((d) => d.embedding)
   }
@@ -498,6 +497,7 @@ function buildRemoteEmbedder(apiUrl: string, apiKey: string | undefined, model: 
     async embedMany(texts: string[]): Promise<number[][]> {
       return request(texts)
     },
+    modelKey,
   }
 }
 
@@ -509,49 +509,48 @@ function buildRemoteEmbedder(apiUrl: string, apiKey: string | undefined, model: 
  */
 function getEmbedder(config: ResolvedConfig): Promise<LoadResult | LoadFailure> {
   const key =
-    config.embeddingBackend === "remote"
-      ? `remote:${config.remoteApiUrl}:${config.embeddingModel}`
-      : `python:${EMBED_SERVER_PORT}`
+    config.embeddingBackend === "endpoint"
+      ? `endpoint:${config.embeddingBaseUrl}:${config.embeddingModel}`
+      : `builtin:${EMBED_SERVER_PORT}`
   if (embedderState && embedderState.key === key && embedderState.ok) return embedderState.promise
   // Backoff: a permanently-dead backend is re-probed at most once per window. Otherwise every
-  // qualifying message would re-run the probe (python: up to 10s spawn wait; remote: a network
+  // qualifying message would re-run the probe (builtin: up to 10s spawn wait; endpoint: a network
   // round-trip), slowing each message and spamming spawn attempts.
   if (Date.now() - lastLoadFailAt < LOAD_FAIL_BACKOFF_MS) {
     return Promise.resolve({ ok: false, reason: lastLoadFailReason })
   }
   const promise = (async (): Promise<LoadResult | LoadFailure> => {
-    if (config.embeddingBackend === "remote") {
-      if (!config.remoteApiUrl) return { ok: false, reason: "remote" }
+    if (config.embeddingBackend === "endpoint") {
+      if (!config.embeddingBaseUrl) return { ok: false, reason: "endpoint" }
+      const baseUrl = config.embeddingBaseUrl
+      const apiKey = resolveSecret(config.embeddingApiKey)
+      const modelKey = `endpoint:${baseUrl}:${config.embeddingModel}`
       try {
         // Eager probe OUTSIDE makeSelfHealing: a single attempt. Running it through the retry
-        // wrapper would double the spawn/probe work on a permanently-failing backend.
-        const raw = buildRemoteEmbedder(
-          config.remoteApiUrl,
-          resolveSecret(config.remoteApiKey),
-          config.embeddingModel
-        )
-        await raw.embed("ping")
-        const embedder = makeSelfHealing(() =>
-          Promise.resolve(
-            buildRemoteEmbedder(config.remoteApiUrl!, resolveSecret(config.remoteApiKey), config.embeddingModel)
-          )
+        // wrapper would double the probe work on a permanently-failing endpoint.
+        await buildOpenAIEmbedder(baseUrl, apiKey, config.embeddingModel, modelKey).embed("ping")
+        const embedder = makeSelfHealing(
+          () => Promise.resolve(buildOpenAIEmbedder(baseUrl, apiKey, config.embeddingModel, modelKey)),
+          modelKey
         )
         return { ok: true, embedder }
       } catch {
-        return { ok: false, reason: "remote" }
+        return { ok: false, reason: "endpoint" }
       }
     }
     try {
-      const base = await ensurePythonServer(config.embeddingModel)
-      if (!base) return { ok: false, reason: "model" }
+      const service = await ensureBuiltinService(config.embeddingModel)
+      if (!service) return { ok: false, reason: "model" }
+      // 确认复用到的服务确实讲 OpenAI 协议（防旧版 /embed 服务占用端口 → 每条消息 404）
+      await buildOpenAIEmbedder(service.baseUrl, undefined, config.embeddingModel, service.modelKey).embed("ping")
       const embedder = makeSelfHealing(async () => {
-        const b2 = await ensurePythonServer(config.embeddingModel)
-        if (!b2) throw new Error("python embed server unavailable")
-        return buildPythonEmbedder(b2)
-      })
+        const s2 = await ensureBuiltinService(config.embeddingModel)
+        if (!s2) throw new Error("embeddings service unavailable")
+        return buildOpenAIEmbedder(s2.baseUrl, undefined, config.embeddingModel, s2.modelKey)
+      }, service.modelKey)
       return { ok: true, embedder }
     } catch (e) {
-      console.error(`[opencode-md-memory] python embedder failed: ${(e as Error)?.message?.slice(0, 200)}`)
+      console.error(`[opencode-md-memory] builtin embedder failed: ${(e as Error)?.message?.slice(0, 200)}`)
       return { ok: false, reason: "model" }
     }
   })()
@@ -595,6 +594,8 @@ interface IndexEntry {
 
 interface IndexData {
   dim: number
+  /** Embedding-space identity the index was built with (absent on pre-model-switch indexes). */
+  model?: string
   entries: IndexEntry[]
 }
 
@@ -623,7 +624,7 @@ async function readIndex(root: string, config: ResolvedConfig): Promise<IndexDat
     const sig = `${mst.mtimeMs}:${vst.mtimeMs}`
     if (indexCache && indexCache.key === dir && indexCache.sig === sig) return indexCache.data
 
-    const meta = JSON.parse(await fs.readFile(metaFile, "utf-8")) as { dim?: number; entries?: { id: string; title: string }[] }
+    const meta = JSON.parse(await fs.readFile(metaFile, "utf-8")) as { dim?: number; model?: string; entries?: { id: string; title: string }[] }
     if (typeof meta.dim !== "number" || !Array.isArray(meta.entries)) return null
     const raw = await fs.readFile(vecFile)
     const vecs = new Float32Array(raw.buffer, raw.byteOffset, raw.byteLength / 4)
@@ -634,7 +635,7 @@ async function readIndex(root: string, config: ResolvedConfig): Promise<IndexDat
       title: e.title,
       vec: vecs.slice(i * dim, (i + 1) * dim),
     }))
-    const data: IndexData = { dim, entries }
+    const data: IndexData = { dim, model: typeof meta.model === "string" ? meta.model : undefined, entries }
     indexCache = { key: dir, sig, data }
     return data
   } catch {
@@ -644,7 +645,7 @@ async function readIndex(root: string, config: ResolvedConfig): Promise<IndexDat
 }
 
 /** Write back the index: `index.json` (id+title, small) + `vectors.bin` (flat float32), each atomic via temp file + rename */
-async function writeIndex(root: string, config: ResolvedConfig, entries: IndexEntry[]): Promise<void> {
+async function writeIndex(root: string, config: ResolvedConfig, entries: IndexEntry[], model?: string): Promise<void> {
   await ensureMemoryRoot(root, config)
   const dir = indexDir(root, config)
   await fs.mkdir(dir, { recursive: true })
@@ -659,7 +660,7 @@ async function writeIndex(root: string, config: ResolvedConfig, entries: IndexEn
     flat.set(e.vec, i * dim)
   })
 
-  const meta = { dim, entries: entries.map((e) => ({ id: e.id, title: e.title })) }
+  const meta = { dim, model, entries: entries.map((e) => ({ id: e.id, title: e.title })) }
   const metaFile = path.join(dir, INDEX_FILE)
   const vecFile = path.join(dir, VECTORS_FILE)
 
@@ -732,24 +733,37 @@ async function syncIndex(root: string, config: ResolvedConfig, embedder: Embedde
     if (prev) for (const e of prev.entries) entries.set(e.id, e)
     for (const id of [...entries.keys()]) if (!current.has(id)) entries.delete(id)
 
+    // Embedding-space identity: rebuild if the model changed — including dimension-preserving
+    // swaps (nomic-768 → embeddinggemma-2-768), where a dim-only check would mix vector spaces.
+    // Pre-existing indexes have no `model` field → treated as changed → one-time rebuild.
+    const modelKey = embedder.modelKey
+    const modelChanged = !!modelKey && prev?.model !== modelKey
+
     const toEmbed: { id: string; title: string }[] = []
     for (const [id, title] of current) {
       const ex = entries.get(id)
-      if (!ex || ex.title !== title) toEmbed.push({ id, title })
+      if (modelChanged || !ex || ex.title !== title) toEmbed.push({ id, title })
     }
     if (toEmbed.length) {
       const texts = toEmbed.map((e) => `${e.id} ${e.title}`)
       const vecs = await embedder.embedMany(texts)
       const dim = vecs[0].length
-      if (prev && prev.dim !== dim) {
-        // embedding model changed (different dimension) → rebuild the whole index
-        // instead of mixing old/new dims, which would corrupt vectors.bin or NaN ranking
+      if (modelChanged || (prev && prev.dim !== dim)) {
+        // rebuild the whole index instead of mixing vectors from two spaces. When modelChanged,
+        // `toEmbed` already covers every current entry → reuse `vecs` (no second embed pass).
         entries.clear()
-        const all: { id: string; title: string }[] = [...current].map(([id, title]) => ({ id, title }))
-        const allVecs = await embedder.embedMany(all.map((e) => `${e.id} ${e.title}`))
-        for (let i = 0; i < all.length; i++) {
-          const e = all[i]
-          entries.set(e.id, { id: e.id, title: e.title, vec: Float32Array.from(allVecs[i]) })
+        if (modelChanged) {
+          for (let i = 0; i < toEmbed.length; i++) {
+            const e = toEmbed[i]
+            entries.set(e.id, { id: e.id, title: e.title, vec: Float32Array.from(vecs[i]) })
+          }
+        } else {
+          const all: { id: string; title: string }[] = [...current].map(([id, title]) => ({ id, title }))
+          const allVecs = await embedder.embedMany(all.map((e) => `${e.id} ${e.title}`))
+          for (let i = 0; i < all.length; i++) {
+            const e = all[i]
+            entries.set(e.id, { id: e.id, title: e.title, vec: Float32Array.from(allVecs[i]) })
+          }
         }
       } else {
         for (let i = 0; i < toEmbed.length; i++) {
@@ -757,7 +771,7 @@ async function syncIndex(root: string, config: ResolvedConfig, embedder: Embedde
           entries.set(e.id, { id: e.id, title: e.title, vec: Float32Array.from(vecs[i]) })
         }
       }
-      await writeIndex(root, config, [...entries.values()])
+      await writeIndex(root, config, [...entries.values()], modelKey)
     }
     return entries
   })
@@ -784,12 +798,12 @@ async function buildMemoryReference(
   if (!loaded.ok) {
     const reason =
       loaded.reason === "deps"
-        ? "injector skipped: python embedding server unavailable. Ensure python3 with onnxruntime+tokenizers is installed (see python/embed_server.py)."
-        : loaded.reason === "remote"
-          ? config.remoteApiUrl
-            ? `injector skipped: remote embeddings API "${config.remoteApiUrl}" failed. Check remoteApiUrl/remoteApiKey/embeddingModel.`
-            : `injector skipped: embeddingBackend is "remote" but remoteApiUrl is not set.`
-          : "injector skipped: local embedding model could not be loaded. Ensure python3 with onnxruntime+tokenizers (see python/embed_server.py)."
+        ? "injector skipped: builtin embeddings service unavailable. Ensure python3 with onnxruntime+tokenizers is installed (see python/embed_server.py)."
+        : loaded.reason === "endpoint"
+          ? config.embeddingBaseUrl
+            ? `injector skipped: embeddings endpoint "${config.embeddingBaseUrl}" failed. Check embeddingBaseUrl/embeddingApiKey/embeddingModel.`
+            : `injector skipped: embeddingBackend is "endpoint" but embeddingBaseUrl is not set.`
+          : "injector skipped: builtin embedding model could not be loaded. Ensure python3 with onnxruntime+tokenizers is installed (see python/embed_server.py), or set embeddingBackend \"endpoint\"."
     log("warn", reason.replace(/^injector skipped: /, ""), { reason: loaded.reason })
     return null
   }
