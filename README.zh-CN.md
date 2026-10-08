@@ -57,10 +57,10 @@
         "idPrefix": "mdm_",
         "maxReadSet": 200,
         "injectorEnabled": false,
-        "embeddingBackend": "remote",
-        "remoteApiUrl": "https://api.openai.com/v1",
-        "remoteApiKey": "{env:OPENAI_API_KEY}",
-        "embeddingModel": "nomic-embed-text-v1",
+        "embeddingBackend": "endpoint",
+        "embeddingBaseUrl": "https://api.openai.com/v1",
+        "embeddingApiKey": "{env:OPENAI_API_KEY}",
+        "embeddingModel": "embeddinggemma-2",
         "injectorTopK": 3,
         "injectorMinLen": 10,
         "injectorMaxPerSession": 5
@@ -76,11 +76,11 @@
 | `storageRoot`           | string | —                             | 固定的存储绝对路径，例如 `"~/.opencode-memory"`。设置后记忆直接存于此路径，与项目目录无关，适合跨项目共享同一份记忆。 |
 | `idPrefix`              | string | `mdm_`                        | 记忆文件 id 前缀，例如 `"mem_"` → `mem_1`。                                                      |
 | `maxReadSet`            | number | `200`                         | 已读集合记住的 id 上限；超出后最早的已读记录会被清除。                                            |
-| `injectorEnabled`       | boolean| `false`                       | 通过 V2 `prompt`/`context` hooks 将记忆参考注入聊天。需要嵌入（本地或远程）。                    |
-| `embeddingBackend`      | string | `remote`                      | `"remote"`（OpenAI 兼容 API）或 `"python"`（本地 Python 嵌入服务）。本地/离线嵌入用 python。 |
-| `remoteApiUrl`          | string | —                             | 远程嵌入 API 的 Base URL，例如 `https://api.openai.com/v1`。                                     |
-| `remoteApiKey`          | string | —                             | 远程嵌入 API 密钥。支持 `{env:VAR}` 或 `$VAR` 从环境变量读取。                                    |
-| `embeddingModel`        | string | `nomic-embed-text-v1`         | 嵌入模型 id。远程后端传给 API；python 后端解析为 `~/.opencode-md-memory/models/{model}/onnx/`。 |
+| `injectorEnabled`       | boolean| `false`                       | 通过 V2 `prompt`/`context` hooks 将记忆参考注入聊天。需要一个嵌入后端。                          |
+| `embeddingBackend`      | string | `builtin`                     | `"builtin"`（插件自管本地服务，模型自包含）或 `"endpoint"`（任意外部 OpenAI 兼容服务：llama.cpp / Ollama / TEI / LM Studio / OpenAI）。 |
+| `embeddingBaseUrl`      | string | —                             | `"endpoint"` 后端的 Base URL，例如 `http://127.0.0.1:8080/v1`（llama.cpp）或 `https://api.openai.com/v1`。 |
+| `embeddingApiKey`       | string | —                             | `"endpoint"` 后端的 API 密钥。支持 `{env:VAR}` 或 `$VAR` 从环境变量读取。                         |
+| `embeddingModel`        | string | `embeddinggemma-2`            | 嵌入模型 id：传给端点；`builtin` 时作为本地模型目录名（`~/.opencode-md-memory/models/<model>/onnx`）。 |
 | `injectorTopK`          | number | `3`                           | 每次触发注入的最大参考条目数。                                                                   |
 | `injectorMinLen`        | number | `10`                          | 触发注入的最小消息长度（字符）；更短的消息跳过。                                                 |
 | `injectorMaxPerSession` | number | `5`                           | 每个会话的最大注入次数，防止上下文膨胀。                                                          |
@@ -97,19 +97,27 @@
 
 **默认关闭**。
 
-**远程后端**（默认）：设置 `embeddingBackend: "remote"` 并配置 `remoteApiUrl`、`remoteApiKey`、`embeddingModel`。注入器调用 OpenAI 兼容的 `/embeddings` 端点。`remoteApiKey` 支持 `{env:VAR}` 或 `$VAR` 从环境变量读取，避免明文存于 `opencode.json`。
+**统一接口** —— 所有后端都讲 OpenAI 兼容的 `POST {base}/embeddings`（`{model, input}` → `{data:[{embedding}]}`），与 llama.cpp / Ollama / TEI / LM Studio / OpenAI 同一协议。插件不依赖任何特定运行时或共享模型路径。
 
-**Python 后端**：需要本地/离线嵌入时设置 `embeddingBackend: "python"`。插件会启动随包分发的 `python/embed_server.py`，通过 onnxruntime + tokenizers 加载本地 ONNX 模型，提供本地 HTTP `/embed` 接口。需要：
+**`builtin`**（默认）：零配置本地嵌入。插件启动随包分发的 `python/embed_server.py`，本地提供上述 API，并在首次使用时**自动下载**模型到 `~/.opencode-md-memory/models/<model>/onnx`。需要：
 
 ```bash
 pip install onnxruntime tokenizers numpy
 ```
 
-模型默认指向 `~/.opencode-md-memory/models/nomic-embed-text-v1`——从 Hugging Face 下载 `Xenova/nomic-embed-text-v1` 解压到该目录即可。若模型在其他位置，用 `MDM_EMBED_MODEL_DIR`（或 `EMBED_MODEL_DIR`）覆盖。若 `python3` 缺少依赖，可用 `PYTHON` 环境变量指定其他解释器。
+用 `MDM_EMBED_MODEL_DIR`（或 `EMBED_MODEL_DIR`）覆盖模型位置；`MDM_EMBED_AUTO_FETCH=0` 关闭自动下载；`PYTHON` 指定解释器；`HF_ENDPOINT` 指定下载镜像。
 
-若嵌入服务（python）或 API（remote）不可用，注入器记录警告并跳过，不中断会话。
+**`endpoint`**：指向你已有的任意 OpenAI 兼容嵌入服务——例如用 **llama.cpp** 托管 EmbeddingGemma-2：
 
-> **索引持久化**：仅将每条记忆的 `id + 语义标题` 嵌入并存储为 `.memory/.index/index.json` 中的元数据，向量存于扁平二进制文件 `.memory/.index/vectors.bin`。语义标题取正文首个 `# H1` 标题（文件无 H1 时回退用文件名 slug）。会话首次注入时，索引会与当前文件做增量同步——新文件嵌入追加、已删除文件移除、语义标题发生变化的文件重新嵌入。正文编辑若未改动 H1 则不会使索引失效，因此常规编辑无需重嵌入。索引是缓存，通过自动写入的 `.memory/.gitignore` 排除在 git 之外。
+```jsonc
+{ "embeddingBackend": "endpoint", "embeddingBaseUrl": "http://127.0.0.1:8080/v1", "embeddingModel": "embeddinggemma-2" }
+```
+
+（同样适用于 Ollama `/v1`、TEI、LM Studio、OpenAI。）`embeddingApiKey` 支持 `{env:VAR}` 或 `$VAR`。
+
+若后端不可用，注入器记录警告并跳过，不中断会话。
+
+> **索引持久化**：仅将每条记忆的 `id + 语义标题` 嵌入并存储为 `.memory/.index/index.json` 中的元数据，向量存于扁平二进制文件 `.memory/.index/vectors.bin`。语义标题取正文首个 `# H1` 标题（文件无 H1 时回退用文件名 slug）。会话首次注入时，索引会与当前文件做增量同步——新文件嵌入追加、已删除文件移除、语义标题发生变化的文件重新嵌入。正文编辑若未改动 H1 则不会使索引失效，因此常规编辑无需重嵌入。索引同时记录其**嵌入空间标识**：若模型发生变化（包括**同维度**的更换，如 nomic→EmbeddingGemma-2），下次会话会整体重建索引，避免混用两个空间的向量。索引是缓存，通过自动写入的 `.memory/.gitignore` 排除在 git 之外。
 
 ## 工具
 
